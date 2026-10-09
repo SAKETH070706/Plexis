@@ -12,8 +12,12 @@ const router = express.Router();
 function emitSocket(req, eventName, payload, targetRoom = null) {
   const io = req.app.get('io');
   if (!io) return;
+  const orgId = req.user?.organizationId;
   if (targetRoom) {
     io.to(targetRoom).emit(eventName, payload);
+  } else if (orgId) {
+    io.to(`admin:${orgId.toString()}`).emit(eventName, payload);
+    io.to(`org:${orgId.toString()}`).emit(eventName, payload);
   } else {
     io.to('admin').emit(eventName, payload);
   }
@@ -23,6 +27,10 @@ function emitSocket(req, eventName, payload, targetRoom = null) {
 async function calculateAndSavePayout(attendanceId, orgId, customNotes = '') {
   const attendance = await Attendance.findById(attendanceId).populate('eventId');
   if (!attendance) throw new Error('Attendance record not found');
+
+  if (orgId && attendance.organizationId && attendance.organizationId.toString() !== orgId.toString()) {
+    throw new Error('Access denied: Attendance record belongs to another organization');
+  }
 
   const event = attendance.eventId;
   const basePay = Number(event.sessionPay) || 0;
@@ -56,21 +64,39 @@ async function calculateAndSavePayout(attendanceId, orgId, customNotes = '') {
   // Create new Payout
   const totalAmount = basePay + travelAllowance + overtimePay;
 
-  const payout = new Payout({
-    organizationId: orgId,
-    eventId: event._id,
-    freelancerId: attendance.freelancerId,
-    attendanceId: attendance._id,
-    basePay,
-    overtimePay,
-    travelAllowance,
-    totalAmount,
-    status: 'pending',
-    notes: customNotes,
-  });
+  try {
+    const payout = new Payout({
+      organizationId: orgId,
+      eventId: event._id,
+      freelancerId: attendance.freelancerId,
+      attendanceId: attendance._id,
+      basePay,
+      overtimePay,
+      travelAllowance,
+      totalAmount,
+      status: 'pending',
+      notes: customNotes,
+    });
 
-  await payout.save();
-  return payout;
+    await payout.save();
+    return payout;
+  } catch (saveErr) {
+    if (saveErr.code === 11000) {
+      const concurrentPayout = await Payout.findOne({ attendanceId: attendance._id });
+      if (concurrentPayout) {
+        if (concurrentPayout.status !== 'paid') {
+          concurrentPayout.basePay = basePay;
+          concurrentPayout.travelAllowance = travelAllowance;
+          concurrentPayout.overtimePay = overtimePay;
+          concurrentPayout.totalAmount = basePay + travelAllowance + overtimePay + (concurrentPayout.bonus || 0) - (concurrentPayout.deduction || 0);
+          concurrentPayout.updatedAt = Date.now();
+          await concurrentPayout.save();
+        }
+        return concurrentPayout;
+      }
+    }
+    throw saveErr;
+  }
 }
 
 // ─── 1. GENERATE PAYOUT (Admin or Trigger) ───────────────────────────
@@ -279,23 +305,34 @@ router.patch('/:id/paid', adminAuth, async (req, res) => {
   try {
     const { paymentReference, notes } = req.body;
 
-    const payout = await Payout.findOne({
-      _id: req.params.id,
-      organizationId: req.user.organizationId,
-    });
+    const payout = await Payout.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        organizationId: req.user.organizationId,
+        status: { $ne: 'paid' },
+      },
+      {
+        $set: {
+          status: 'paid',
+          paidAt: new Date(),
+          ...(paymentReference ? { paymentReference } : {}),
+          ...(notes ? { notes } : {}),
+          updatedAt: Date.now(),
+        },
+      },
+      { new: true }
+    );
 
-    if (!payout) return res.status(404).json({ message: 'Payout not found' });
-    if (payout.status === 'paid') {
-      return res.status(400).json({ message: 'Payout is already marked as paid' });
+    if (!payout) {
+      const existing = await Payout.findOne({
+        _id: req.params.id,
+        organizationId: req.user.organizationId,
+      });
+      if (existing && existing.status === 'paid') {
+        return res.status(400).json({ message: 'Payout is already marked as paid' });
+      }
+      return res.status(404).json({ message: 'Payout not found' });
     }
-
-    const oldStatus = payout.status;
-    payout.status = 'paid';
-    payout.paidAt = new Date();
-    if (paymentReference) payout.paymentReference = paymentReference;
-    if (notes) payout.notes = (payout.notes ? payout.notes + ' | ' : '') + notes;
-    payout.updatedAt = Date.now();
-    await payout.save();
 
     // Immutable Audit Log
     await AuditLog.create({
@@ -304,7 +341,6 @@ router.patch('/:id/paid', adminAuth, async (req, res) => {
       action: 'MARK_PAYOUT_PAID',
       entityType: 'Payout',
       entityId: payout._id,
-      oldValue: { status: oldStatus },
       newValue: { status: 'paid', paymentReference, totalAmount: payout.totalAmount },
       reason: `Disbursed with ref: ${paymentReference || 'N/A'}`,
     });
@@ -333,9 +369,12 @@ router.patch('/:id/adjust', adminAuth, async (req, res) => {
     }
 
     const oldTotal = payout.totalAmount;
-    payout.bonus = Number(bonus);
-    payout.deduction = Number(deduction);
-    payout.totalAmount = payout.basePay + payout.travelAllowance + payout.overtimePay + payout.bonus - payout.deduction;
+    const safeBonus = Math.max(0, Number(bonus) || 0);
+    const safeDeduction = Math.max(0, Number(deduction) || 0);
+
+    payout.bonus = safeBonus;
+    payout.deduction = safeDeduction;
+    payout.totalAmount = Math.max(0, (payout.basePay || 0) + (payout.travelAllowance || 0) + (payout.overtimePay || 0) + safeBonus - safeDeduction);
     payout.updatedAt = Date.now();
     await payout.save();
 

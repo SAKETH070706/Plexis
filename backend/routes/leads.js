@@ -1,18 +1,24 @@
 const express = require('express');
 const Lead = require('../models/Lead');
 const { auth, adminAuth } = require('../middleware/auth');
-const { isValidEmail, isValidPhone, formatPhone } = require('../utils/validators');
+const { isValidEmail, isValidPhone, formatPhone, escapeRegex } = require('../utils/validators');
 const router = express.Router();
 
 /**
  * Emit a lead event to:
  *  - the lead owner's personal room
- *  - the 'admin' room (so all admins see every lead change)
- * Never uses io.emit() which would broadcast to every socket.
+ *  - the tenant's admin room: `admin:${orgId}`
+ * Never broadcasts across multiple tenant organizations.
  */
-function emitLeadEvent(io, eventName, payload, ownerUserId) {
-  io.to(ownerUserId.toString()).emit(eventName, payload);
-  io.to('admin').emit(eventName, payload);
+function emitLeadEvent(io, eventName, payload, ownerUserId, orgId = null) {
+  if (!io) return;
+  if (ownerUserId) {
+    io.to(ownerUserId.toString()).emit(eventName, payload);
+  }
+  if (orgId) {
+    io.to(`admin:${orgId.toString()}`).emit(eventName, payload);
+    io.to(`org:${orgId.toString()}`).emit(eventName, payload);
+  }
 }
 
 // ── Create lead ──────────────────────────────────────────────────────
@@ -49,7 +55,7 @@ router.post('/', auth, async (req, res) => {
     await lead.populate('userId', 'name email');
 
     const io = req.app.get('io');
-    emitLeadEvent(io, 'leadCreated', lead, req.user.id);
+    emitLeadEvent(io, 'leadCreated', lead, req.user.id, lead.organizationId);
 
     res.status(201).json(lead);
   } catch (err) {
@@ -74,10 +80,11 @@ router.get('/', auth, async (req, res) => {
     }
 
     if (search) {
+      const safeSearch = escapeRegex(String(search).trim());
       query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } },
+        { name: { $regex: safeSearch, $options: 'i' } },
+        { email: { $regex: safeSearch, $options: 'i' } },
+        { phone: { $regex: safeSearch, $options: 'i' } },
       ];
     }
     if (status) query.status = status;
@@ -113,8 +120,12 @@ router.get('/:id', auth, async (req, res) => {
     const lead = await Lead.findById(req.params.id).populate('userId', 'name email');
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
 
-    if (req.user.role !== 'admin' && lead.userId._id.toString() !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
+    if (req.user.role !== 'admin') {
+      if (lead.userId._id.toString() !== req.user.id) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+    } else if (req.user.organizationId && lead.organizationId && lead.organizationId.toString() !== req.user.organizationId.toString()) {
+      return res.status(403).json({ message: 'Access denied: Lead belongs to another organization' });
     }
 
     res.json(lead);
@@ -132,8 +143,12 @@ router.put('/:id', auth, async (req, res) => {
 
     const ownerId = lead.userId.toString();
 
-    if (req.user.role !== 'admin' && ownerId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
+    if (req.user.role !== 'admin') {
+      if (ownerId !== req.user.id) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+    } else if (req.user.organizationId && lead.organizationId && lead.organizationId.toString() !== req.user.organizationId.toString()) {
+      return res.status(403).json({ message: 'Access denied: Lead belongs to another organization' });
     }
 
     if (name !== undefined) {
@@ -177,7 +192,7 @@ router.put('/:id', auth, async (req, res) => {
     await lead.populate('userId', 'name email');
 
     const io = req.app.get('io');
-    emitLeadEvent(io, 'leadUpdated', lead, ownerId);
+    emitLeadEvent(io, 'leadUpdated', lead, ownerId, lead.organizationId);
 
     res.json(lead);
   } catch (err) {
@@ -194,8 +209,12 @@ router.post('/:id/notes', auth, async (req, res) => {
 
     const ownerId = lead.userId.toString();
 
-    if (req.user.role !== 'admin' && ownerId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
+    if (req.user.role !== 'admin') {
+      if (ownerId !== req.user.id) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+    } else if (req.user.organizationId && lead.organizationId && lead.organizationId.toString() !== req.user.organizationId.toString()) {
+      return res.status(403).json({ message: 'Access denied: Lead belongs to another organization' });
     }
 
     lead.notes.push({ text });
@@ -205,7 +224,7 @@ router.post('/:id/notes', auth, async (req, res) => {
     await lead.populate('userId', 'name email');
 
     const io = req.app.get('io');
-    emitLeadEvent(io, 'leadUpdated', lead, ownerId);
+    emitLeadEvent(io, 'leadUpdated', lead, ownerId, lead.organizationId);
 
     res.json(lead);
   } catch (err) {
@@ -219,12 +238,16 @@ router.delete('/:id', adminAuth, async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
 
+    if (req.user.organizationId && lead.organizationId && lead.organizationId.toString() !== req.user.organizationId.toString()) {
+      return res.status(403).json({ message: 'Access denied: Lead belongs to another organization' });
+    }
+
     const ownerId = lead.userId.toString();
 
     await Lead.findByIdAndDelete(req.params.id);
 
     const io = req.app.get('io');
-    emitLeadEvent(io, 'leadDeleted', req.params.id, ownerId);
+    emitLeadEvent(io, 'leadDeleted', req.params.id, ownerId, lead.organizationId);
 
     res.json({ message: 'Lead deleted' });
   } catch (err) {
@@ -232,4 +255,4 @@ router.delete('/:id', adminAuth, async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = router;

@@ -18,6 +18,14 @@ cloudinary.config({
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
+    if (allowedMimes.includes(file.mimetype?.toLowerCase())) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only JPEG, PNG, WEBP, and HEIC images are allowed.'));
+    }
+  },
 });
 
 const router = express.Router();
@@ -26,11 +34,30 @@ const router = express.Router();
 function emitSocket(req, eventName, payload, targetRoom = null) {
   const io = req.app.get('io');
   if (!io) return;
+  const orgId = req.user?.organizationId;
   if (targetRoom) {
     io.to(targetRoom).emit(eventName, payload);
+  } else if (orgId) {
+    io.to(`admin:${orgId.toString()}`).emit(eventName, payload);
+    io.to(`org:${orgId.toString()}`).emit(eventName, payload);
+    io.to('admin').emit(eventName, payload);
   } else {
     io.to('admin').emit(eventName, payload);
   }
+}
+
+// Helper to parse camera EXIF DateTimeOriginal ("YYYY:MM:DD HH:MM:SS") into valid JavaScript Date
+function parseExifDate(rawStr) {
+  if (!rawStr || typeof rawStr !== 'string') return new Date();
+  const trimmed = rawStr.trim();
+  const [d, t] = trimmed.split(' ');
+  if (d && t && d.includes(':')) {
+    const iso = `${d.replace(/:/g, '-')}T${t}`;
+    const parsed = new Date(iso);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  const fallback = new Date(trimmed);
+  return !isNaN(fallback.getTime()) ? fallback : new Date();
 }
 
 // Helper to build full Date objects from event date and time strings
@@ -88,11 +115,23 @@ router.post('/check-in', auth, async (req, res) => {
     const windowStart = new Date(scheduledStart.getTime() - 30 * 60 * 1000); // 30 mins before
     const now = new Date();
 
-    if (process.env.NODE_ENV !== 'test' && !req.headers['x-bypass-time-gate']) {
-      // Validate Date
-      const todayStr = now.toISOString().split('T')[0];
-      const eventDateStr = new Date(event.date).toISOString().split('T')[0];
-      if (todayStr !== eventDateStr || now < windowStart) {
+    if (process.env.NODE_ENV !== 'test') {
+      // Validate Date using timezone-tolerant local and UTC comparisons
+      const toLocalDateStr = (d) => {
+        const dt = new Date(d);
+        const y = dt.getFullYear();
+        const m = String(dt.getMonth() + 1).padStart(2, '0');
+        const day = String(dt.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+      };
+      const todayLocal = toLocalDateStr(now);
+      const eventLocal = toLocalDateStr(event.date);
+      const todayUtc = now.toISOString().split('T')[0];
+      const eventUtc = new Date(event.date).toISOString().split('T')[0];
+
+      const isSameDate = (todayLocal === eventLocal) || (todayUtc === eventUtc);
+
+      if (!isSameDate || now < windowStart) {
         return res.status(400).json({
           message: 'Check-in is locked. You can only check in on the event day starting 30 minutes before the start time.',
         });
@@ -151,6 +190,19 @@ router.post('/check-in', auth, async (req, res) => {
       attendance,
     });
   } catch (err) {
+    if (err.code === 11000) {
+      const existing = await Attendance.findOne({
+        eventId: req.body.eventId,
+        freelancerId: req.user.id,
+        status: { $in: ['checked_in', 'manual_review'] },
+      });
+      if (existing) {
+        return res.status(200).json({
+          message: 'Already checked in',
+          attendance: existing,
+        });
+      }
+    }
     res.status(500).json({ message: err.message });
   }
 });
@@ -396,10 +448,10 @@ router.post('/upload-overtime-proof', auth, upload.single('photo'), async (req, 
       stream.end(req.file.buffer);
     });
 
-    // Extract EXIF capture date and camera model
+    // Extract EXIF capture date and camera model safely
     const exifDate = uploadResult.image_metadata?.DateTimeOriginal
-      ? new Date(uploadResult.image_metadata.DateTimeOriginal)
-      : (clientCapturedAt ? new Date(clientCapturedAt) : new Date());
+      ? parseExifDate(uploadResult.image_metadata.DateTimeOriginal)
+      : (clientCapturedAt ? parseExifDate(clientCapturedAt) : new Date());
 
     const exifModel = uploadResult.image_metadata?.Model || deviceModel || 'Mobile Device';
 
@@ -539,7 +591,7 @@ router.post('/request-correction', auth, async (req, res) => {
 
     await request.save();
 
-    emitSocket(req, 'attendanceRequestCreated', request, 'admin');
+    emitSocket(req, 'attendanceRequestCreated', request);
 
     res.status(201).json({
       message: 'Attendance exception request submitted for admin review',

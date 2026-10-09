@@ -75,4 +75,55 @@ describe('Input Validation Utilities', () => {
       expect(formatPhone(undefined)).toBe('');
     });
   });
+
+  describe('Geo Utilities (geo.js)', () => {
+    const { isValidCoordinate, calculateDistanceMeters, isWithinGeofence } = require('../utils/geo');
+
+    it('validates coordinates within standard geographical bounds', () => {
+      expect(isValidCoordinate(17.4722, 78.3728)).toBe(true);
+      expect(isValidCoordinate(-33.8688, 151.2093)).toBe(true);
+      expect(isValidCoordinate(0, 0)).toBe(true);
+      expect(isValidCoordinate(90, 180)).toBe(true);
+      expect(isValidCoordinate(-90, -180)).toBe(true);
+    });
+
+    it('rejects invalid or out-of-bounds coordinates', () => {
+      expect(isValidCoordinate(91, 78.3728)).toBe(false); // latitude > 90
+      expect(isValidCoordinate(-95, 78.3728)).toBe(false); // latitude < -90
+      expect(isValidCoordinate(17.4722, 185)).toBe(false); // longitude > 180
+      expect(isValidCoordinate(NaN, 78.3728)).toBe(false);
+      expect(isValidCoordinate('abc', 78.3728)).toBe(false);
+      expect(isValidCoordinate(null, 78.3728)).toBe(false);
+    });
+
+    it('calculates accurate distance between coordinates', () => {
+      // Distance between HICC Novotel (17.4722, 78.3728) and nearby spot (17.4725, 78.3730)
+      const dist = calculateDistanceMeters(17.4722, 78.3728, 17.4725, 78.3730);
+      expect(dist).toBeGreaterThan(0);
+      expect(dist).toBeLessThan(100);
+    });
+
+    it('returns Infinity for invalid coordinates in distance calculation', () => {
+      expect(calculateDistanceMeters('invalid', 78.3728, 17.4722, 78.3728)).toBe(Infinity);
+      expect(calculateDistanceMeters(17.4722, 78.3728, 100, 78.3728)).toBe(Infinity);
+    });
+
+    it('correctly evaluates geofence boundaries', () => {
+      // Exact same point
+      const inside = isWithinGeofence(17.4722, 78.3728, 17.4722, 78.3728, 150);
+      expect(inside.isWithin).toBe(true);
+      expect(inside.distanceMeters).toBe(0);
+
+      // Distant point (50 km away)
+      const outside = isWithinGeofence(17.4722, 78.3728, 17.0000, 78.0000, 150);
+      expect(outside.isWithin).toBe(false);
+      expect(outside.distanceMeters).toBeGreaterThan(150);
+
+      // Invalid coordinates safely return isWithin: false without NaN
+      const invalid = isWithinGeofence('bad', 'coords', 17.4722, 78.3728, 150);
+      expect(invalid.isWithin).toBe(false);
+      expect(Number.isFinite(invalid.distanceMeters)).toBe(true);
+    });
+  });
 });
+

@@ -105,7 +105,11 @@ const FreelancerPortal = ({ user }) => {
     const windowEnd = new Date(eDate.getTime() + 60 * 60 * 1000); // 60 mins after
     const now = new Date();
 
-    const isToday = now.toISOString().split('T')[0] === new Date(event.date).toISOString().split('T')[0];
+    const toLocalDateStr = (d) => {
+      const dt = new Date(d);
+      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    };
+    const isToday = (toLocalDateStr(now) === toLocalDateStr(event.date)) || (now.toISOString().split('T')[0] === new Date(event.date).toISOString().split('T')[0]);
 
     if (!isToday || now < windowStart) {
       return {
@@ -278,7 +282,7 @@ const FreelancerPortal = ({ user }) => {
         setGpsLoading(false);
         setStatusMessage('GPS Error: ' + err.message + '. Please allow location access or submit a manual request.');
       },
-      { enableHighAccuracy: true, timeout: 15000 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
   };
 
@@ -395,7 +399,7 @@ const FreelancerPortal = ({ user }) => {
         navigator.geolocation.getCurrentPosition(
           (pos) => resolve(pos.coords),
           () => resolve(null),
-          { enableHighAccuracy: true, timeout: 6000 }
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
         );
       });
     } catch {

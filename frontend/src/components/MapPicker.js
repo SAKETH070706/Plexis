@@ -204,7 +204,7 @@ const MapPicker = ({
         setLoadingGps(false);
         alert('Unable to retrieve location: ' + err.message);
       },
-      { enableHighAccuracy: true, timeout: 10000 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
   };
 

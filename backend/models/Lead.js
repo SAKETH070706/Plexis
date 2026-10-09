@@ -19,4 +19,6 @@ const LeadSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
+LeadSchema.index({ organizationId: 1, status: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Lead', LeadSchema);

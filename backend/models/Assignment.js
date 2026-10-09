@@ -48,5 +48,6 @@ const AssignmentSchema = new mongoose.Schema({
 // Compound unique index: prevents duplicate assignment of the same freelancer to the same event
 AssignmentSchema.index({ eventId: 1, freelancerId: 1 }, { unique: true });
 AssignmentSchema.index({ organizationId: 1, freelancerId: 1, status: 1 });
+AssignmentSchema.index({ eventId: 1, status: 1 });
 
 module.exports = mongoose.model('Assignment', AssignmentSchema);

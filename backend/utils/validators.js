@@ -60,8 +60,20 @@ function formatPhone(phone) {
   return phone.trim();
 }
 
+/**
+ * Escapes characters with special meaning in regular expressions
+ * to prevent ReDoS or unintended pattern matching in search queries
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeRegex(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 module.exports = {
   isValidEmail,
   isValidPhone,
   formatPhone,
+  escapeRegex,
 };

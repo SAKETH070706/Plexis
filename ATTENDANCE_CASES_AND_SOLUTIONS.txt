@@ -1,0 +1,165 @@
+================================================================================
+          PLEXIS WORKFORCE MANAGEMENT - ATTENDANCE & OVERTIME SYSTEM
+              HOW OUR SOLUTION HANDLES CASES & ERRORS IN PLAIN ENGLISH
+================================================================================
+
+1. THE STANDARD HAPPY PATH (NORMAL DAY-TO-DAY CASE)
+--------------------------------------------------------------------------------
+Here is what happens on a completely normal, smooth working day:
+
+Step 1: Arrival & Check-In
+  - Freelancer reaches the wedding/event hall.
+  - Exactly 30 minutes before the event start time, the app opens.
+  - Because they granted Chrome location access, the app detects they entered the 
+    venue (e.g., within 150 meters).
+  - Check-in happens AUTOMATICALLY in the background. A green badge pops up: 
+    "Welcome to [Event Name]! Auto Check-In Successful."
+  - If they prefer, they can also simply tap the "Check In" button.
+
+Step 2: Working the Shift
+  - The freelancer works their standard shift (e.g., 9:00 AM to 1:00 PM).
+  - The app displays active shift status and earnings in progress.
+
+Step 3: On-Time Checkout
+  - At 1:00 PM, the event finishes on schedule.
+  - The freelancer taps "Stop Shift / Check Out".
+  - Because there was no overtime, checkout happens instantly.
+  - No photos required, no complex steps. Shift completed, payment calculated.
+
+
+================================================================================
+2. HOW OUR SOLUTION SOLVES REAL-WORLD ERRORS & EDGE CASES
+================================================================================
+
+CASE 1: "Freelancer tries to check in yesterday, tomorrow, or hours too early"
+--------------------------------------------------------------------------------
+* The Problem:
+  Freelancers accidentally or dishonestly tap check-in from their house the night 
+  before or hours before the event starts.
+* Our Solution:
+  - Both the backend server and frontend lock the check-in button.
+  - Check-in is strictly blocked until 30 minutes before the scheduled Start Time 
+    on the exact day of the event.
+  - If someone tries early, the server rejects it with error: 
+    "Check-in locked. Opens 30 minutes before event start."
+  - UI shows a countdown: "🔒 Opens at 8:30 AM (30 mins prior to shift)".
+
+
+CASE 2: "Freelancer denies Chrome GPS permission or phone GPS is weak"
+--------------------------------------------------------------------------------
+* The Problem:
+  Chrome doesn't have background location permission, or user is in a basement hall 
+  where auto-detection takes too long.
+* Our Solution:
+  - The system NEVER relies only on auto-detection.
+  - A bright manual "Check In" button is always present on the screen as fallback.
+  - When the user taps the manual button, it takes a fresh one-shot GPS reading.
+  - If GPS is completely unavailable indoors, they can tap "Report Exception" 
+    so the admin can manually approve their attendance.
+
+
+CASE 3: "Freelancer checks in from home or 5 kilometers away from venue"
+--------------------------------------------------------------------------------
+* The Problem:
+  Worker claims they are at the event, but they are actually stuck in traffic or at home.
+* Our Solution:
+  - The server calculates the exact distance (in meters) between the worker's GPS 
+    and the venue coordinates using the Haversine formula.
+  - If distance is greater than the venue radius (e.g. 150m):
+    The check-in is NOT accepted as verified. Instead, it gets marked as 
+    "MANUAL_REVIEW" with an alert to the Admin: 
+    "Worker checked in 3.4 km away from venue".
+  - Admin decides whether to approve or reject the hours.
+
+
+CASE 4: "Shift ends, worker forgets to check out and goes home"
+--------------------------------------------------------------------------------
+* The Problem:
+  At 1:00 PM, the shift ends. The worker packs their cameras, leaves the venue, 
+  and forgets to tap "Check Out" until midnight. Should they get paid 11 hours overtime?
+* Our Solution:
+  - At the exact scheduled End Time, a 30-Minute Grace Countdown pops up on screen.
+  - If the worker walks away and takes NO ACTION for 30 minutes:
+    The system AUTOMATICALLY STOPS and checks out the shift.
+  - The checkout time is recorded strictly as: Scheduled End Time + 30 minutes.
+  - An audit log is saved: "Shift automatically stopped after 30-minute grace period".
+  - The studio owner does NOT get overcharged for forgotten checkouts.
+
+
+CASE 5: "Event runs late and worker actually needs to work overtime"
+--------------------------------------------------------------------------------
+* The Problem:
+  The wedding reception gets delayed and runs 2 hours extra. The worker needs to 
+  stay and work, not get auto-stopped.
+* Our Solution:
+  - When the End Time arrives and the 30-minute grace modal appears, the worker 
+    simply taps "EXTEND SHIFT".
+  - The 30-minute auto-stop timer is immediately CANCELLED.
+  - The shift transitions into "⚡ Live Overtime Mode".
+  - A live counter ticks on screen showing current overtime (+45m, +1h 15m, etc.).
+  - WE DO NOT ASK FOR PHOTOS YET, because the overtime work has just started!
+
+
+CASE 6: "Worker finishes overtime and clicks Checkout (Proof of Work)"
+--------------------------------------------------------------------------------
+* The Problem:
+  After working 2 hours extra, the worker wants their overtime pay. The studio owner 
+  needs proof that the worker was actually still there working, not drinking tea outside.
+* Our Solution:
+  - When the worker taps "Check Out" at the conclusion of their overtime:
+  - The system detects: "Overtime Detected (+2 hours)".
+  - A modal pops up: "Shift Finished - Please snap a photo of the completed venue/stage".
+  - The camera opens directly. The worker snaps a photo of the stage/hall.
+  - The photo is uploaded to Cloudinary.
+  - The shift completes, and the overtime claim is submitted with the attached proof.
+
+
+CASE 7: "Worker tries to upload an old photo from yesterday or a saved screenshot"
+--------------------------------------------------------------------------------
+* The Problem:
+  Worker wants overtime money, so they upload a photo they took yesterday or a downloaded picture.
+* Our Solution (EXIF Shutter Timestamp):
+  - Every photo taken by a phone camera embeds raw EXIF metadata inside the file.
+  - Our system automatically extracts the `DateTimeOriginal` tag (the exact second 
+    the camera sensor snapped the image).
+  - If someone picks yesterday's photo, the EXIF timestamp immediately exposes that 
+    it was taken yesterday, not tonight!
+  - Furthermore, our server records the exact UTC timestamp the upload hit our servers, 
+    so changing the phone clock does not fool the system.
+
+
+CASE 8: "Android phone strips the GPS from the photo for privacy"
+--------------------------------------------------------------------------------
+* The Problem:
+  Modern Android OS (Android 11 to 14) sometimes removes GPS location tags from photos 
+  for privacy protection.
+* Our Solution (Dual-Layer Fallback):
+  - Layer 1: We attempt to read the photo's embedded EXIF GPS tags.
+  - Layer 2: At the exact second the photo is snapped, our app automatically takes a 
+    high-accuracy GPS reading from the Chrome browser.
+  - The photo is bundled with this live verified location.
+  - Result: Even if Android deletes the photo's internal GPS, our system STILL captures 
+    the exact venue coordinates where the worker was standing.
+
+
+CASE 9: "Phone battery dies or network connection drops"
+--------------------------------------------------------------------------------
+* The Problem:
+  Worker's phone shuts down or there is zero internet in a remote resort.
+* Our Solution:
+  - The "Report Attendance Exception" feature allows workers to submit missed 
+    punches as soon as they reconnect or get home.
+  - The request includes the reason (e.g., "Phone died", "No network in basement").
+  - The Admin reviews the incident against event logs and can approve the hours with 1 click.
+
+
+================================================================================
+3. SUMMARY FOR ADMINS & STUDIO OWNERS
+================================================================================
+- Owners have complete peace of mind: No one can punch in from home or days early.
+- No accidental overpaying: Shifts auto-terminate if workers forget to check out.
+- Honest Overtime: Workers get paid fairly for legitimate overtime, backed by 
+  timestamped and geotagged photographic evidence.
+- Zero friction for standard workers: If a shift is on time, checkout takes 1 second 
+  with no photo requirements.
+================================================================================

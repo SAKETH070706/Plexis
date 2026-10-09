@@ -34,10 +34,12 @@ const EventSchema = new mongoose.Schema({
   startTime: {
     type: String,
     required: [true, 'Start time is required (e.g., 09:00)'],
+    match: [/^([01]\d|2[0-3]):([0-5]\d)$/, 'Invalid start time format. Expected HH:MM (e.g., 09:00)'],
   },
   endTime: {
     type: String,
     required: [true, 'End time is required (e.g., 17:00)'],
+    match: [/^([01]\d|2[0-3]):([0-5]\d)$/, 'Invalid end time format. Expected HH:MM (e.g., 17:00)'],
   },
   location: {
     address: {

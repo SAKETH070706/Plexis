@@ -1,18 +1,20 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
 import { io } from 'socket.io-client';
 import api, { BACKEND_URL } from './api';
 import Login from './components/Login';
 import Register from './components/Register';
 import Sidebar from './components/Sidebar';
 import Topbar from './components/Topbar';
-import AdminOverview from './components/AdminOverview';
-import EventsManager from './components/EventsManager';
-import CrewManager from './components/CrewManager';
-import AttendanceMonitor from './components/AttendanceMonitor';
-import PayoutsLedger from './components/PayoutsLedger';
-import FreelancerPortal from './components/FreelancerPortal';
-import Dashboard from './components/Dashboard'; // Original Leads CRM preserved
 import './App.css';
+
+// Code-split module views
+const AdminOverview = lazy(() => import('./components/AdminOverview'));
+const EventsManager = lazy(() => import('./components/EventsManager'));
+const CrewManager = lazy(() => import('./components/CrewManager'));
+const AttendanceMonitor = lazy(() => import('./components/AttendanceMonitor'));
+const PayoutsLedger = lazy(() => import('./components/PayoutsLedger'));
+const FreelancerPortal = lazy(() => import('./components/FreelancerPortal'));
+const Dashboard = lazy(() => import('./components/Dashboard'));
 
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem('token'));
@@ -122,10 +124,17 @@ function App() {
     // Real-Time Workforce Alerts
     socket.on('workerCheckedIn', (data) => {
       showToast(`📍 Crew member checked in! (${data.checkInLocation?.isWithinGeofence ? 'Within geofence' : 'Outside venue'})`);
+      window.dispatchEvent(new CustomEvent('attendance:update', { detail: data }));
     });
 
     socket.on('workerCheckedOut', (data) => {
       showToast(`⏱️ Crew member checked out! (${data.overtimeMinutes > 0 ? `${data.overtimeMinutes}m overtime` : 'On time'})`);
+      window.dispatchEvent(new CustomEvent('attendance:update', { detail: data }));
+    });
+
+    socket.on('overtimeProofUploaded', (data) => {
+      showToast('📸 New overtime photo proof uploaded for review');
+      window.dispatchEvent(new CustomEvent('attendance:update', { detail: data }));
     });
 
     socket.on('assignmentCreated', (data) => {
@@ -136,8 +145,9 @@ function App() {
       showToast(`💰 Payout of ₹${data.totalAmount} approved!`);
     });
 
-    socket.on('attendanceRequestCreated', () => {
+    socket.on('attendanceRequestCreated', (data) => {
       showToast('⚠️ New manual attendance exception request submitted');
+      window.dispatchEvent(new CustomEvent('attendance:update', { detail: data }));
     });
 
     // Lead CRM Socket Updates
@@ -235,46 +245,48 @@ function App() {
         />
 
         <main style={{ flex: 1 }}>
-          {isAdmin ? (
-            /* ADMIN MODULES */
-            <>
-              {activeTab === 'overview' && (
-                <AdminOverview onNavigateTab={handleNavigateTab} organization={organization} />
-              )}
-              {activeTab === 'events' && (
-                <EventsManager
-                  autoOpenCreateModal={autoOpenCreateEvent}
-                  onCloseAutoModal={() => setAutoOpenCreateEvent(false)}
-                />
-              )}
-              {activeTab === 'crew' && <CrewManager />}
-              {activeTab === 'attendance' && <AttendanceMonitor />}
-              {activeTab === 'payouts' && <PayoutsLedger />}
-              {activeTab === 'leads' && (
-                <div className="page-container">
-                  <div className="page-header">
-                    <div className="page-title">
-                      <h1>Client Leads CRM</h1>
-                      <p>Track wedding client inquiries, quotations, and convert them to live events</p>
-                    </div>
-                  </div>
-                  <Dashboard
-                    leads={leads}
-                    user={user}
-                    onLogout={handleLogout}
-                    fetchLeads={fetchLeads}
+          <Suspense fallback={<div style={{ padding: '2rem', color: '#94a3b8', textAlign: 'center' }}>Loading module...</div>}>
+            {isAdmin ? (
+              /* ADMIN MODULES */
+              <>
+                {activeTab === 'overview' && (
+                  <AdminOverview onNavigateTab={handleNavigateTab} organization={organization} />
+                )}
+                {activeTab === 'events' && (
+                  <EventsManager
+                    autoOpenCreateModal={autoOpenCreateEvent}
+                    onCloseAutoModal={() => setAutoOpenCreateEvent(false)}
                   />
-                </div>
-              )}
-            </>
-          ) : (
-            /* FREELANCER MODULES */
-            <>
-              {activeTab === 'portal' && <FreelancerPortal user={user} />}
-              {activeTab === 'attendance' && <AttendanceMonitor />}
-              {activeTab === 'earnings' && <PayoutsLedger />}
-            </>
-          )}
+                )}
+                {activeTab === 'crew' && <CrewManager />}
+                {activeTab === 'attendance' && <AttendanceMonitor />}
+                {activeTab === 'payouts' && <PayoutsLedger />}
+                {activeTab === 'leads' && (
+                  <div className="page-container">
+                    <div className="page-header">
+                      <div className="page-title">
+                        <h1>Client Leads CRM</h1>
+                        <p>Track wedding client inquiries, quotations, and convert them to live events</p>
+                      </div>
+                    </div>
+                    <Dashboard
+                      leads={leads}
+                      user={user}
+                      onLogout={handleLogout}
+                      fetchLeads={fetchLeads}
+                    />
+                  </div>
+                )}
+              </>
+            ) : (
+              /* FREELANCER MODULES */
+              <>
+                {activeTab === 'portal' && <FreelancerPortal user={user} />}
+                {activeTab === 'attendance' && <AttendanceMonitor />}
+                {activeTab === 'earnings' && <PayoutsLedger />}
+              </>
+            )}
+          </Suspense>
         </main>
       </div>
     </div>

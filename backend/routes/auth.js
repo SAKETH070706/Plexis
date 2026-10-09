@@ -5,7 +5,14 @@ const User = require('../models/User');
 const Organization = require('../models/Organization');
 const { auth, adminAuth } = require('../middleware/auth');
 const { isValidEmail, isValidPhone, formatPhone } = require('../utils/validators');
+const { createRateLimiter } = require('../middleware/rateLimiter');
 const router = express.Router();
+
+const authLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: 'Too many attempts from this IP, please try again after 15 minutes',
+});
 
 // Helper to sign JWT
 const signToken = (user) => {
@@ -22,7 +29,7 @@ const signToken = (user) => {
 };
 
 // ── Register new user ────────────────────────────────────────────────
-router.post('/register', async (req, res) => {
+router.post('/register', authLimiter, async (req, res) => {
   const { name, email, password, role, organizationName, organizationId, studioCode, phone } = req.body;
 
   if (!name || typeof name !== 'string' || name.trim().length < 2) {
@@ -61,23 +68,19 @@ router.post('/register', async (req, res) => {
 
     // Handle Organization association
     if (assignedRole === 'admin') {
-      // Check if an unowned or existing organization exists (e.g. STU-7TM4)
       let org = null;
       if (studioCode) {
         org = await Organization.findOne({ studioCode: studioCode.trim().toUpperCase() });
       }
-      if (!org) {
-        const allOrgs = await Organization.find({});
-        for (const candidate of allOrgs) {
-          const ownerExists = await User.findById(candidate.ownerId);
-          if (!ownerExists) {
-            org = candidate;
-            break;
-          }
-        }
-      }
 
       if (org) {
+        // Prevent claiming an organization that already has an owner
+        if (org.ownerId && org.ownerId.toString() !== user._id.toString()) {
+          const ownerExists = await User.findById(org.ownerId);
+          if (ownerExists) {
+            return res.status(400).json({ message: 'This studio organization is already registered. Please login or contact the studio owner.' });
+          }
+        }
         org.ownerId = user._id;
         if (organizationName) org.name = organizationName;
         await org.save();
@@ -164,10 +167,11 @@ router.post('/register', async (req, res) => {
 });
 
 // ── Login user ───────────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', authLimiter, async (req, res) => {
   const { email, password, studioCode, organizationId } = req.body;
   try {
-    const user = await User.findOne({ email });
+    const normalizedEmail = email ? email.trim().toLowerCase() : '';
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) return res.status(401).json({ message: 'Invalid credentials' });
 
     const isMatch = await bcrypt.compare(password, user.password);
@@ -300,14 +304,10 @@ router.get('/workers', adminAuth, async (req, res) => {
       if (singleOrg) orgId = singleOrg._id;
     }
 
-    const query = { role: { $in: ['freelancer', 'user'] } };
-    if (orgId) {
-      query.$or = [
-        { organizationId: orgId },
-        { organizationId: null },
-        { organizationId: { $exists: false } }
-      ];
-    }
+    const query = {
+      role: { $in: ['freelancer', 'user'] },
+      organizationId: orgId,
+    };
 
     const workers = await User.find(query).select('-password');
     res.json(workers);

@@ -27,6 +27,15 @@ const AttendanceMonitor = () => {
 
   useEffect(() => {
     fetchData();
+
+    const handleLiveUpdate = () => {
+      fetchData();
+    };
+
+    window.addEventListener('attendance:update', handleLiveUpdate);
+    return () => {
+      window.removeEventListener('attendance:update', handleLiveUpdate);
+    };
   }, []);
 
   const fetchData = async () => {

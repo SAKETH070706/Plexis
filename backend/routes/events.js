@@ -4,7 +4,7 @@ const Assignment = require('../models/Assignment');
 const User = require('../models/User');
 const Lead = require('../models/Lead');
 const { auth, adminAuth } = require('../middleware/auth');
-const { isValidPhone, formatPhone } = require('../utils/validators');
+const { isValidPhone, formatPhone, escapeRegex } = require('../utils/validators');
 
 const router = express.Router();
 
@@ -12,10 +12,13 @@ const router = express.Router();
 function emitSocket(req, eventName, payload, targetRoom = null) {
   const io = req.app.get('io');
   if (!io) return;
-  if (targetRoom) {
+  const orgId = req.user?.organizationId;
+  if (targetRoom && targetRoom !== 'admin') {
     io.to(targetRoom).emit(eventName, payload);
+  } else if (orgId) {
+    io.to(`admin:${orgId.toString()}`).emit(eventName, payload);
+    io.to(`org:${orgId.toString()}`).emit(eventName, payload);
   } else {
-    // Default to admin room
     io.to('admin').emit(eventName, payload);
   }
 }
@@ -122,10 +125,11 @@ router.get('/', auth, async (req, res) => {
     if (status) query.status = status;
     if (mode) query.assignmentMode = mode;
     if (search) {
+      const safeSearch = escapeRegex(String(search).trim());
       query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { clientName: { $regex: search, $options: 'i' } },
-        { 'location.address': { $regex: search, $options: 'i' } },
+        { title: { $regex: safeSearch, $options: 'i' } },
+        { clientName: { $regex: safeSearch, $options: 'i' } },
+        { 'location.address': { $regex: safeSearch, $options: 'i' } },
       ];
     }
 
@@ -157,15 +161,29 @@ router.get('/', auth, async (req, res) => {
       Event.countDocuments(query),
     ]);
 
-    // Attach assignment counts to events
+    // Compute assignment counts per event using database aggregation
     const eventIds = events.map((e) => e._id);
-    const activeAssignments = await Assignment.find({
-      eventId: { $in: eventIds },
-      status: { $in: ['assigned', 'accepted'] },
-    });
+    const assignmentCountsAgg = await Assignment.aggregate([
+      {
+        $match: {
+          eventId: { $in: eventIds },
+          status: { $in: ['assigned', 'accepted'] },
+        },
+      },
+      {
+        $group: {
+          _id: '$eventId',
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const countsMap = new Map(
+      assignmentCountsAgg.map((item) => [item._id.toString(), item.count])
+    );
 
     const eventsWithCounts = events.map((ev) => {
-      const assignedCount = activeAssignments.filter((a) => a.eventId.toString() === ev._id.toString()).length;
+      const assignedCount = countsMap.get(ev._id.toString()) || 0;
       return {
         ...ev.toObject(),
         assignedCount,

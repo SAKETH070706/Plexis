@@ -130,5 +130,13 @@ const AttendanceSchema = new mongoose.Schema({
 
 AttendanceSchema.index({ organizationId: 1, eventId: 1, freelancerId: 1 });
 AttendanceSchema.index({ organizationId: 1, status: 1 });
+// Compound partial unique index: guarantees at most one active shift per worker per event
+AttendanceSchema.index(
+  { eventId: 1, freelancerId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: { $in: ['checked_in', 'manual_review'] } },
+  }
+);
 
 module.exports = mongoose.model('Attendance', AttendanceSchema);

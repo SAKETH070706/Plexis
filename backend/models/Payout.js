@@ -79,6 +79,7 @@ const PayoutSchema = new mongoose.Schema({
   },
 });
 
+PayoutSchema.index({ attendanceId: 1 }, { unique: true });
 PayoutSchema.index({ organizationId: 1, freelancerId: 1, status: 1 });
 PayoutSchema.index({ organizationId: 1, eventId: 1 });
 
