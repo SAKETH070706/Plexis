@@ -5,7 +5,14 @@ const User = require('../models/User');
 
 describe('Auth Routes', () => {
   beforeAll(async () => {
-    await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/crm_test');
+    const testUri = process.env.MONGO_URI_TEST || (
+      process.env.MONGO_URI
+        ? process.env.MONGO_URI.replace('/crm?', '/crm_test?').replace(/\/crm$/, '/crm_test')
+        : 'mongodb://localhost:27017/crm_test'
+    );
+    if (mongoose.connection.readyState === 0) {
+      await mongoose.connect(testUri);
+    }
   });
 
   afterAll(async () => {

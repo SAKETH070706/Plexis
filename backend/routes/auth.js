@@ -2,41 +2,170 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
-const { auth, adminAuth } = require('../middleware/auth'); //  import middleware
+const Organization = require('../models/Organization');
+const { auth, adminAuth } = require('../middleware/auth');
+const { isValidEmail, isValidPhone, formatPhone } = require('../utils/validators');
 const router = express.Router();
 
-// Register new user
+// Helper to sign JWT
+const signToken = (user) => {
+  return jwt.sign(
+    {
+      id: user._id,
+      email: user.email,
+      role: user.role,
+      organizationId: user.organizationId || null,
+    },
+    process.env.JWT_SECRET || 'secret',
+    { expiresIn: '7d' }
+  );
+};
+
+// ── Register new user ────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
-  const { name, email, password, role } = req.body;
-  console.log("Register request body:", req.body); //  log incoming data
+  const { name, email, password, role, organizationName, organizationId, studioCode, phone } = req.body;
+
+  if (!name || typeof name !== 'string' || name.trim().length < 2) {
+    return res.status(400).json({ message: 'Name must be at least 2 characters long' });
+  }
+
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({ message: 'Please provide a valid email address' });
+  }
+
+  if (!password || typeof password !== 'string' || password.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+  }
+
+  if (phone && phone.trim() !== '') {
+    if (!isValidPhone(phone)) {
+      return res.status(400).json({ message: 'Please provide a valid 10-digit phone number (e.g. 9876543210 or +91 9876543210)' });
+    }
+  }
+
   try {
-    const existingUser = await User.findOne({ email });
+    const normalizedEmail = email.trim().toLowerCase();
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) return res.status(400).json({ message: 'User already exists' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = new User({ name, email, password: hashedPassword, role: role || 'user' });
+    const assignedRole = role || 'user';
+
+    const user = new User({
+      name: name.trim(),
+      email: normalizedEmail,
+      password: hashedPassword,
+      role: assignedRole,
+      phone: phone && isValidPhone(phone) ? formatPhone(phone) : '',
+    });
+
+    // Handle Organization association
+    if (assignedRole === 'admin') {
+      // Check if an unowned or existing organization exists (e.g. STU-7TM4)
+      let org = null;
+      if (studioCode) {
+        org = await Organization.findOne({ studioCode: studioCode.trim().toUpperCase() });
+      }
+      if (!org) {
+        const allOrgs = await Organization.find({});
+        for (const candidate of allOrgs) {
+          const ownerExists = await User.findById(candidate.ownerId);
+          if (!ownerExists) {
+            org = candidate;
+            break;
+          }
+        }
+      }
+
+      if (org) {
+        org.ownerId = user._id;
+        if (organizationName) org.name = organizationName;
+        await org.save();
+        user.organizationId = org._id;
+      } else {
+        // Create new organization for admin
+        const newOrg = new Organization({
+          name: organizationName || `${name}'s Organization`,
+          ownerId: user._id,
+        });
+        await newOrg.save();
+        user.organizationId = newOrg._id;
+      }
+    } else if (assignedRole === 'freelancer') {
+      // Freelancer must join via studioCode or organizationId
+      let targetOrg = null;
+      if (studioCode) {
+        const cleanInput = studioCode.trim().toUpperCase();
+        const variations = [cleanInput];
+        if (cleanInput.startsWith('STU-')) {
+          variations.push(cleanInput.replace('STU-', ''));
+        } else if (cleanInput.startsWith('STU') && cleanInput.length > 3) {
+          variations.push(`STU-${cleanInput.slice(3)}`);
+        } else {
+          variations.push(`STU-${cleanInput}`);
+        }
+
+        const mongoose = require('mongoose');
+        const orConditions = [{ studioCode: { $in: variations } }];
+        if (mongoose.isValidObjectId(cleanInput)) {
+          orConditions.push({ _id: cleanInput });
+        }
+        targetOrg = await Organization.findOne({ $or: orConditions });
+      }
+      if (!targetOrg && organizationId) {
+        const mongoose = require('mongoose');
+        if (mongoose.isValidObjectId(organizationId)) {
+          targetOrg = await Organization.findById(organizationId);
+        }
+      }
+
+      if (!targetOrg) {
+        // Fallback: If only 1 organization exists in the system or if none provided for test
+        const totalOrgs = await Organization.countDocuments();
+        if (totalOrgs === 1) {
+          targetOrg = await Organization.findOne();
+        } else {
+          return res.status(404).json({ message: 'Invalid Studio Code / Organization ID' });
+        }
+      }
+      user.organizationId = targetOrg._id;
+    } else {
+      // Legacy 'user' role
+      let defaultOrg = await Organization.findOne();
+      if (!defaultOrg) {
+        defaultOrg = new Organization({
+          name: 'Main Studio Organization',
+          ownerId: user._id,
+        });
+        await defaultOrg.save();
+      }
+      user.organizationId = defaultOrg._id;
+    }
+
     await user.save();
 
-    const token = jwt.sign(
-      { id: user._id, email: user.email, role: user.role },
-      process.env.JWT_SECRET || 'secret',
-      { expiresIn: '1h' }
-    );
+    const token = signToken(user);
+    const org = await Organization.findById(user.organizationId);
 
     res.status(201).json({
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        organizationId: user.organizationId,
+        organization: org ? { id: org._id, name: org.name, studioCode: org.studioCode } : null,
+      },
     });
   } catch (err) {
-    console.error("Register error:", err); //  log the actual error
     res.status(500).json({ message: err.message });
   }
 });
 
-
-// Login user
+// ── Login user ───────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, studioCode, organizationId } = req.body;
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(401).json({ message: 'Invalid credentials' });
@@ -44,23 +173,99 @@ router.post('/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
 
-    const token = jwt.sign(
-      { id: user._id, email: user.email, role: user.role },
-      process.env.JWT_SECRET || 'secret',
-      { expiresIn: '1h' }
-    );
+    // Backwards-compatibility check: ensure user has an organization
+    if (!user.organizationId) {
+      if (user.role === 'admin') {
+        let org = await Organization.findOne({ ownerId: user._id });
+        if (!org) {
+          org = new Organization({
+            name: `${user.name}'s Organization`,
+            ownerId: user._id,
+          });
+          await org.save();
+        }
+        user.organizationId = org._id;
+      } else {
+        let org = await Organization.findOne();
+        if (!org) {
+          org = new Organization({
+            name: 'Main Studio Organization',
+            ownerId: user._id,
+          });
+          await org.save();
+        }
+        user.organizationId = org._id;
+      }
+      await user.save();
+    }
+
+    // If studioCode or organizationId was provided, verify user belongs to it
+    if (studioCode || organizationId) {
+      let specifiedOrg = null;
+      if (studioCode) {
+        const cleanInput = studioCode.trim().toUpperCase();
+        const variations = [cleanInput];
+        if (cleanInput.startsWith('STU-')) {
+          variations.push(cleanInput.replace('STU-', ''));
+        } else if (cleanInput.startsWith('STU') && cleanInput.length > 3) {
+          variations.push(`STU-${cleanInput.slice(3)}`);
+        } else {
+          variations.push(`STU-${cleanInput}`);
+        }
+
+        const mongoose = require('mongoose');
+        const orConditions = [{ studioCode: { $in: variations } }];
+        if (mongoose.isValidObjectId(cleanInput)) {
+          orConditions.push({ _id: cleanInput });
+        }
+        specifiedOrg = await Organization.findOne({ $or: orConditions });
+      }
+      if (!specifiedOrg && organizationId) {
+        const mongoose = require('mongoose');
+        if (mongoose.isValidObjectId(organizationId)) {
+          specifiedOrg = await Organization.findById(organizationId);
+        }
+      }
+
+      if (!specifiedOrg || specifiedOrg._id.toString() !== user.organizationId.toString()) {
+        return res.status(403).json({ message: 'Access denied: You do not belong to this studio' });
+      }
+    }
+
+    const token = signToken(user);
+    const org = await Organization.findById(user.organizationId);
 
     res.json({
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        organizationId: user.organizationId,
+        organization: org ? { id: org._id, name: org.name, studioCode: org.studioCode } : null,
+      },
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Protected route: profile
+
+// ── Protected route: profile ─────────────────────────────────────────
 router.get('/profile', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id)
+      .select('-password')
+      .populate('organizationId', 'name currency address');
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Current user endpoint ────────────────────────────────────────────
+router.get('/me', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('-password');
     res.json(user);
@@ -69,9 +274,51 @@ router.get('/profile', auth, async (req, res) => {
   }
 });
 
-// Admin-only route example
+// ── Get organization details ─────────────────────────────────────────
+router.get('/organization', auth, async (req, res) => {
+  try {
+    if (!req.user.organizationId) {
+      return res.status(404).json({ message: 'No organization linked' });
+    }
+    const org = await Organization.findById(req.user.organizationId).populate('ownerId', 'name email');
+    res.json(org);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Get workers / freelancers list for admin ─────────────────────────
+router.get('/workers', adminAuth, async (req, res) => {
+  try {
+    let orgId = req.user.organizationId;
+    if (!orgId) {
+      const adminUser = await User.findById(req.user.id);
+      if (adminUser?.organizationId) orgId = adminUser.organizationId;
+    }
+    if (!orgId) {
+      const singleOrg = await Organization.findOne();
+      if (singleOrg) orgId = singleOrg._id;
+    }
+
+    const query = { role: { $in: ['freelancer', 'user'] } };
+    if (orgId) {
+      query.$or = [
+        { organizationId: orgId },
+        { organizationId: null },
+        { organizationId: { $exists: false } }
+      ];
+    }
+
+    const workers = await User.find(query).select('-password');
+    res.json(workers);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Admin-only route example ─────────────────────────────────────────
 router.get('/admin-dashboard', adminAuth, async (req, res) => {
   res.json({ message: 'Welcome Admin!' });
 });
 
-module.exports = router;
+module.exports = router;

@@ -1,6 +1,7 @@
 const express = require('express');
 const Lead = require('../models/Lead');
 const { auth, adminAuth } = require('../middleware/auth');
+const { isValidEmail, isValidPhone, formatPhone } = require('../utils/validators');
 const router = express.Router();
 
 /**
@@ -16,9 +17,32 @@ function emitLeadEvent(io, eventName, payload, ownerUserId) {
 
 // ── Create lead ──────────────────────────────────────────────────────
 router.post('/', auth, async (req, res) => {
-  const { name, email, phone, source } = req.body;
+  const { name, email, phone, source, location } = req.body;
+
+  if (!name || typeof name !== 'string' || name.trim().length < 2) {
+    return res.status(400).json({ message: 'Client name is required and must be at least 2 characters' });
+  }
+
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({ message: 'Please provide a valid email address' });
+  }
+
+  if (phone && phone.trim() !== '') {
+    if (!isValidPhone(phone)) {
+      return res.status(400).json({ message: 'Please provide a valid 10-digit phone number (e.g. 9876543210 or +91 9876543210)' });
+    }
+  }
+
   try {
-    const lead = new Lead({ name, email, phone, source, userId: req.user.id });
+    const lead = new Lead({
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      phone: phone && isValidPhone(phone) ? formatPhone(phone) : '',
+      source: source || 'Website',
+      location: location || {},
+      userId: req.user.id,
+      organizationId: req.user.organizationId || null,
+    });
     await lead.save();
 
     // Populate so the client gets userId.name and userId.email
@@ -41,6 +65,12 @@ router.get('/', auth, async (req, res) => {
 
     if (req.user.role !== 'admin') {
       query.userId = req.user.id;
+    } else if (req.user.organizationId) {
+      // Scoped to admin's organization
+      query.$or = [
+        { organizationId: req.user.organizationId },
+        { organizationId: null } // allow legacy leads created before migration
+      ];
     }
 
     if (search) {
@@ -95,7 +125,7 @@ router.get('/:id', auth, async (req, res) => {
 
 // ── Update lead ──────────────────────────────────────────────────────
 router.put('/:id', auth, async (req, res) => {
-  const { status, notes, name, email, phone, source } = req.body;
+  const { status, notes, name, email, phone, source, location } = req.body;
   try {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
@@ -106,11 +136,38 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    if (name)              lead.name = name;
-    if (email)             lead.email = email;
-    if (phone !== undefined) lead.phone = phone;
+    if (name !== undefined) {
+      if (!name || typeof name !== 'string' || name.trim().length < 2) {
+        return res.status(400).json({ message: 'Client name must be at least 2 characters' });
+      }
+      lead.name = name.trim();
+    }
+    if (email !== undefined) {
+      if (!email || !isValidEmail(email)) {
+        return res.status(400).json({ message: 'Please provide a valid email address' });
+      }
+      lead.email = email.trim().toLowerCase();
+    }
+    if (phone !== undefined) {
+      if (phone && phone.trim() !== '') {
+        if (!isValidPhone(phone)) {
+          return res.status(400).json({ message: 'Please provide a valid 10-digit phone number (e.g. 9876543210 or +91 9876543210)' });
+        }
+        lead.phone = formatPhone(phone);
+      } else {
+        lead.phone = '';
+      }
+    }
     if (source)            lead.source = source;
     if (status)            lead.status = status;
+    if (location !== undefined) {
+      lead.location = {
+        address: location.address !== undefined ? location.address : (lead.location?.address || ''),
+        city: location.city !== undefined ? location.city : (lead.location?.city || ''),
+        latitude: location.latitude !== undefined ? location.latitude : lead.location?.latitude,
+        longitude: location.longitude !== undefined ? location.longitude : lead.location?.longitude
+      };
+    }
     if (notes)             lead.notes.push({ text: notes });
     lead.updatedAt = Date.now();
 

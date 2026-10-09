@@ -1,59 +1,106 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import axios from 'axios';
 import { io } from 'socket.io-client';
+import api, { BACKEND_URL } from './api';
 import Login from './components/Login';
 import Register from './components/Register';
-import Dashboard from './components/Dashboard';
+import Sidebar from './components/Sidebar';
+import Topbar from './components/Topbar';
+import AdminOverview from './components/AdminOverview';
+import EventsManager from './components/EventsManager';
+import CrewManager from './components/CrewManager';
+import AttendanceMonitor from './components/AttendanceMonitor';
+import PayoutsLedger from './components/PayoutsLedger';
+import FreelancerPortal from './components/FreelancerPortal';
+import Dashboard from './components/Dashboard'; // Original Leads CRM preserved
 import './App.css';
-
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:5000';
 
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem('token'));
   const [user, setUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('user')); } catch { return null; }
+    try {
+      return JSON.parse(localStorage.getItem('user'));
+    } catch {
+      return null;
+    }
   });
-  const [leads, setLeads] = useState([]);
-  const [view, setView] = useState(token ? 'dashboard' : 'login');
+  const [organization, setOrganization] = useState(null);
+  const [authView, setAuthView] = useState('login'); // 'login' or 'register'
+  const [activeTab, setActiveTab] = useState('overview');
+  const [autoOpenCreateEvent, setAutoOpenCreateEvent] = useState(false);
+  const [isSocketConnected, setIsSocketConnected] = useState(false);
+  const [toastMessage, setToastMessage] = useState('');
 
-  // Stable ref for socket — avoids re-creating it on every render
+  const handleNavigateTab = (tab, shouldOpenModal = false) => {
+    setActiveTab(tab);
+    if (tab === 'events' && shouldOpenModal) {
+      setAutoOpenCreateEvent(true);
+    }
+  };
+
+  // Leads CRM state (preserved from original project)
+  const [leads, setLeads] = useState([]);
+
   const socketRef = useRef(null);
 
-  // ─── Fetch leads (stable, memoised) ──────────────────────────────
-  const fetchLeads = useCallback(async (params = {}, setTotalPages = null) => {
-  const currentToken = localStorage.getItem('token');
-  if (!currentToken) return;
-  try {
-    const query = new URLSearchParams(
-      Object.fromEntries(Object.entries(params).filter(([, v]) => v !== '' && v !== undefined))
-    ).toString();
-    const res = await axios.get(`${BACKEND_URL}/api/leads?${query}`, {
-      headers: { Authorization: `Bearer ${currentToken}` },
-    });
-    setLeads(res.data.leads || []);
-    if (setTotalPages && res.data.pagination) {
-      setTotalPages(res.data.pagination.pages);
-    }
-  } catch (err) {
-    console.error('Error fetching leads:', err.response?.data?.message || err.message);
-  }
-}, []);
-
-  // ─── Socket lifecycle — only runs when token changes ─────────────
+  // Set initial default tab based on role
   useEffect(() => {
-    // Tear down any existing socket before creating a new one
+    if (user?.role === 'admin') {
+      setActiveTab('overview');
+    } else if (user) {
+      setActiveTab('portal');
+    }
+  }, [user]);
+
+  // Toast notification helper
+  const showToast = (msg) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(''), 5000);
+  };
+
+  // Fetch Organization Details
+  const fetchOrganization = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await api.get('/auth/organization');
+      setOrganization(res.data);
+    } catch (err) {
+      console.warn('Could not fetch org:', err.message);
+    }
+  }, [token]);
+
+  // Fetch Leads (preserved memoized function)
+  const fetchLeads = useCallback(async (params = {}, setTotalPages = null) => {
+    if (!token) return;
+    try {
+      const query = new URLSearchParams(
+        Object.fromEntries(Object.entries(params).filter(([, v]) => v !== '' && v !== undefined))
+      ).toString();
+
+      const res = await api.get(`/leads?${query}`);
+      setLeads(res.data.leads || []);
+      if (setTotalPages && res.data.pagination) {
+        setTotalPages(res.data.pagination.pages);
+      }
+    } catch (err) {
+      console.error('Fetch leads error:', err);
+    }
+  }, [token]);
+
+  // Socket Lifecycle & Real-Time Event Handlers
+  useEffect(() => {
     if (socketRef.current) {
       socketRef.current.disconnect();
       socketRef.current = null;
     }
 
-    if (!token) return;
+    if (!token) {
+      setIsSocketConnected(false);
+      return;
+    }
 
-    // Set axios default header for REST calls
-    axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+    fetchOrganization();
     fetchLeads();
 
-    // Pass the JWT in the handshake so the server can authenticate the socket
     const socket = io(BACKEND_URL, {
       auth: { token },
       reconnection: true,
@@ -63,58 +110,70 @@ function App() {
 
     socketRef.current = socket;
 
-    // ── Reconnect: re-fetch to get any missed events ────────────
     socket.on('connect', () => {
-      console.log('[Socket] Connected:', socket.id);
-      // Refresh data on every (re-)connect so no updates are missed
+      setIsSocketConnected(true);
       fetchLeads();
     });
 
-    socket.on('connect_error', (err) => {
-      console.error('[Socket] Connection error:', err.message);
+    socket.on('disconnect', () => {
+      setIsSocketConnected(false);
     });
 
-    // ── Lead events ─────────────────────────────────────────────
-    socket.on('leadCreated', (lead) => {
-      setLeads((prev) => {
-        // Guard against duplicates (in case both socket and fetchLeads fire)
-        if (prev.some((l) => l._id === lead._id)) return prev;
-        return [lead, ...prev];
-      });
+    // Real-Time Workforce Alerts
+    socket.on('workerCheckedIn', (data) => {
+      showToast(`📍 Crew member checked in! (${data.checkInLocation?.isWithinGeofence ? 'Within geofence' : 'Outside venue'})`);
+    });
+
+    socket.on('workerCheckedOut', (data) => {
+      showToast(`⏱️ Crew member checked out! (${data.overtimeMinutes > 0 ? `${data.overtimeMinutes}m overtime` : 'On time'})`);
+    });
+
+    socket.on('assignmentCreated', (data) => {
+      showToast('🎉 You have been assigned to an event shift!');
+    });
+
+    socket.on('payoutApproved', (data) => {
+      showToast(`💰 Payout of ₹${data.totalAmount} approved!`);
+    });
+
+    socket.on('attendanceRequestCreated', () => {
+      showToast('⚠️ New manual attendance exception request submitted');
+    });
+
+    // Lead CRM Socket Updates
+    socket.on('leadCreated', (newLead) => {
+      setLeads((prev) => (prev.some((l) => l._id === newLead._id) ? prev : [newLead, ...prev]));
     });
 
     socket.on('leadUpdated', (updatedLead) => {
-      setLeads((prev) =>
-        prev.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead))
-      );
+      setLeads((prev) => prev.map((l) => (l._id === updatedLead._id ? updatedLead : l)));
     });
 
     socket.on('leadDeleted', (deletedId) => {
-      setLeads((prev) => prev.filter((lead) => lead._id !== deletedId));
+      setLeads((prev) => prev.filter((l) => l._id !== deletedId));
     });
 
-    // ── Cleanup ─────────────────────────────────────────────────
     return () => {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [token, fetchLeads]);
+  }, [token, fetchOrganization, fetchLeads]);
 
-  // ─── Auth handlers ────────────────────────────────────────────────
+  // Handle Unauthorized Event
+  useEffect(() => {
+    const handleUnauthorized = () => handleLogout();
+    window.addEventListener('auth:unauthorized', handleUnauthorized);
+    return () => window.removeEventListener('auth:unauthorized', handleUnauthorized);
+  }, []);
+
   const handleLogin = (newToken, newUser) => {
-    localStorage.setItem('token', newToken);
-    localStorage.setItem('user', JSON.stringify(newUser));
     setToken(newToken);
     setUser(newUser);
-    setView('dashboard');
   };
 
   const handleRegister = (newToken, newUser) => {
-    localStorage.setItem('token', newToken);
-    localStorage.setItem('user', JSON.stringify(newUser));
     setToken(newToken);
     setUser(newUser);
-    setView('dashboard');
   };
 
   const handleLogout = () => {
@@ -124,29 +183,100 @@ function App() {
     }
     localStorage.removeItem('token');
     localStorage.removeItem('user');
-    delete axios.defaults.headers.common['Authorization'];
     setToken(null);
     setUser(null);
+    setOrganization(null);
     setLeads([]);
-    setView('login');
+    setAuthView('login');
   };
 
+  // If not logged in -> Show Login / Register
+  if (!token || !user) {
+    return authView === 'login' ? (
+      <Login
+        onLogin={handleLogin}
+        onSwitchToRegister={() => setAuthView('register')}
+      />
+    ) : (
+      <Register
+        onRegister={handleRegister}
+        onSwitchToLogin={() => setAuthView('login')}
+      />
+    );
+  }
+
+  const isAdmin = user.role === 'admin';
+
   return (
-    <div className="App">
-      {!token ? (
-        view === 'login' ? (
-          <Login onLogin={handleLogin} onSwitchToRegister={() => setView('register')} />
-        ) : (
-          <Register onRegister={handleRegister} onSwitchToLogin={() => setView('login')} />
-        )
-      ) : (
-        <Dashboard
-          leads={leads}
-          user={user}
-          onLogout={handleLogout}
-          fetchLeads={fetchLeads}
-        />
+    <div className="app-container">
+      {/* Toast Alert */}
+      {toastMessage && (
+        <div className="toast-notice">
+          <span>🔔</span>
+          <span>{toastMessage}</span>
+        </div>
       )}
+
+      {/* Sidebar Navigation */}
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        user={user}
+        onLogout={handleLogout}
+      />
+
+      {/* Main App Workspace */}
+      <div className="main-wrapper">
+        <Topbar
+          user={user}
+          organization={organization}
+          isLive={isSocketConnected}
+          onLogout={handleLogout}
+        />
+
+        <main style={{ flex: 1 }}>
+          {isAdmin ? (
+            /* ADMIN MODULES */
+            <>
+              {activeTab === 'overview' && (
+                <AdminOverview onNavigateTab={handleNavigateTab} organization={organization} />
+              )}
+              {activeTab === 'events' && (
+                <EventsManager
+                  autoOpenCreateModal={autoOpenCreateEvent}
+                  onCloseAutoModal={() => setAutoOpenCreateEvent(false)}
+                />
+              )}
+              {activeTab === 'crew' && <CrewManager />}
+              {activeTab === 'attendance' && <AttendanceMonitor />}
+              {activeTab === 'payouts' && <PayoutsLedger />}
+              {activeTab === 'leads' && (
+                <div className="page-container">
+                  <div className="page-header">
+                    <div className="page-title">
+                      <h1>Client Leads CRM</h1>
+                      <p>Track wedding client inquiries, quotations, and convert them to live events</p>
+                    </div>
+                  </div>
+                  <Dashboard
+                    leads={leads}
+                    user={user}
+                    onLogout={handleLogout}
+                    fetchLeads={fetchLeads}
+                  />
+                </div>
+              )}
+            </>
+          ) : (
+            /* FREELANCER MODULES */
+            <>
+              {activeTab === 'portal' && <FreelancerPortal user={user} />}
+              {activeTab === 'attendance' && <AttendanceMonitor />}
+              {activeTab === 'earnings' && <PayoutsLedger />}
+            </>
+          )}
+        </main>
+      </div>
     </div>
   );
 }

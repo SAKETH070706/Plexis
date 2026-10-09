@@ -70,7 +70,7 @@ io.on('connection', (socket) => {
 });
 
 // ─── Express Middleware ────────────────────────────────────────────────
-app.use(cors({ origin: ALLOWED_ORIGIN, credentials: true }));
+
 app.use(express.json());
 
 // Make io accessible in routes
@@ -79,6 +79,9 @@ app.set('io', io);
 // ─── Routes ───────────────────────────────────────────────────────────
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/leads', require('./routes/leads'));
+app.use('/api/events', require('./routes/events'));
+app.use('/api/attendance', require('./routes/attendance'));
+app.use('/api/payouts', require('./routes/payouts').router);
 
 // ─── Start Server ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
