@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // Resolve Backend Base URL safely
-let rawBackendUrl = process.env.REACT_APP_BACKEND_URL;
+let rawBackendUrl = process.env.REACT_APP_BACKEND_URL || process.env.REACT_APP_API_URL;
 
 if (!rawBackendUrl) {
   if (

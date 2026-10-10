@@ -1,6 +1,8 @@
 const dns = require("dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -150,12 +152,72 @@ app.use(express.json());
 // Make io accessible in routes
 app.set('io', io);
 
+// ─── Healthcheck & API Status ──────────────────────────────────────────
+app.get(['/health', '/api/health'], (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Plexis Workforce CRM API',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'connecting/disconnected',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// API Root Directory
+app.get('/api', (req, res) => {
+  res.json({
+    status: 'active',
+    service: 'Plexis Workforce CRM API',
+    version: '1.0.0',
+    message: 'Plexis API backend is running successfully.',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'connecting/disconnected',
+    documentation: 'https://github.com/SAKETH070706/Plexis',
+    endpoints: {
+      health: '/api/health',
+      auth: '/api/auth',
+      events: '/api/events',
+      attendance: '/api/attendance',
+      payouts: '/api/payouts',
+      leads: '/api/leads',
+    },
+  });
+});
+
 // ─── Routes ───────────────────────────────────────────────────────────
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/leads', require('./routes/leads'));
 app.use('/api/events', require('./routes/events'));
 app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/payouts', require('./routes/payouts').router);
+
+// ─── Static Frontend Serving (if built) or Root API Landing Page ──────
+const frontendBuildPath = path.join(__dirname, '../frontend/build');
+if (fs.existsSync(frontendBuildPath)) {
+  app.use(express.static(frontendBuildPath));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path === '/health') return next();
+    res.sendFile(path.join(frontendBuildPath, 'index.html'));
+  });
+} else {
+  app.get('/', (req, res) => {
+    res.json({
+      status: 'active',
+      service: 'Plexis Workforce CRM API',
+      version: '1.0.0',
+      message: 'Plexis API backend is running successfully.',
+      database: mongoose.connection.readyState === 1 ? 'connected' : 'connecting/disconnected',
+      documentation: 'https://github.com/SAKETH070706/Plexis',
+      endpoints: {
+        health: '/api/health',
+        auth: '/api/auth',
+        events: '/api/events',
+        attendance: '/api/attendance',
+        payouts: '/api/payouts',
+        leads: '/api/leads',
+      },
+    });
+  });
+}
 
 // ─── Centralized Error Handling Middleware ────────────────────────────
 app.use((err, req, res, next) => {
