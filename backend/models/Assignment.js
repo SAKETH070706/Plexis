@@ -1,6 +1,13 @@
 const mongoose = require('mongoose');
+const { v4: uuidv4 } = require('uuid');
 
 const AssignmentSchema = new mongoose.Schema({
+  uuid: {
+    type: String,
+    unique: true,
+    index: true,
+    default: uuidv4,
+  },
   organizationId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Organization',
@@ -18,8 +25,30 @@ const AssignmentSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['assigned', 'applied', 'accepted', 'declined', 'cancelled'],
+    enum: ['assigned', 'applied', 'accepted', 'waitlist', 'declined', 'cancelled', 'completed'],
     default: 'assigned',
+  },
+  joinedVia: {
+    type: String,
+    enum: ['event_code', 'direct_admin', 'open_apply'],
+    default: 'event_code',
+  },
+  // Denormalized Fast Snapshot
+  eventCode: {
+    type: String,
+    trim: true,
+    uppercase: true,
+  },
+  eventTitle: {
+    type: String,
+    trim: true,
+  },
+  eventDate: {
+    type: Date,
+  },
+  sessionPay: {
+    type: Number,
+    default: 0,
   },
   assignedBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -49,5 +78,6 @@ const AssignmentSchema = new mongoose.Schema({
 AssignmentSchema.index({ eventId: 1, freelancerId: 1 }, { unique: true });
 AssignmentSchema.index({ organizationId: 1, freelancerId: 1, status: 1 });
 AssignmentSchema.index({ eventId: 1, status: 1 });
+AssignmentSchema.index({ freelancerId: 1, status: 1 });
 
 module.exports = mongoose.model('Assignment', AssignmentSchema);

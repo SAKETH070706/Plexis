@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import exifr from 'exifr';
 import api from '../api';
+import { graphqlQuery, GET_FREELANCER_DASHBOARD } from '../graphqlClient';
 import { IconClock, IconCreditCard, IconAlertCircle } from './icons';
 
 // Haversine formula helper for client-side geofence calculation
@@ -46,6 +47,52 @@ const FreelancerPortal = ({ user }) => {
   const [issueReason, setIssueReason] = useState('');
   const [requestedTime, setRequestedTime] = useState('');
 
+  // Autonomous Gig Join with Event Code State
+  const [showJoinCodeModal, setShowJoinCodeModal] = useState(false);
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joiningCodeLoading, setJoiningCodeLoading] = useState(false);
+  const [joinModalError, setJoinModalError] = useState('');
+  const [joinModalSuccess, setJoinModalSuccess] = useState('');
+
+  const handleJoinGigByCode = async (e) => {
+    e.preventDefault();
+    if (!joinCodeInput.trim()) return;
+
+    setJoiningCodeLoading(true);
+    setJoinModalError('');
+    setJoinModalSuccess('');
+
+    try {
+      const res = await api.post('/events/join', {
+        eventCode: joinCodeInput.trim().toUpperCase(),
+      });
+
+      const data = res.data;
+      if (data.isWaitlisted) {
+        setJoinModalSuccess(
+          'Gig capacity is full! You have been placed on the Priority Waitlist as a backup crew member. If a spot opens, you will be notified.'
+        );
+      } else {
+        setJoinModalSuccess('Joined event successfully! Shift confirmed.');
+      }
+
+      await loadPortalData();
+
+      setTimeout(() => {
+        setShowJoinCodeModal(false);
+        setJoinCodeInput('');
+        setJoinModalSuccess('');
+      }, 2200);
+    } catch (err) {
+      console.error('Join event error:', err);
+      const errMsg =
+        err.response?.data?.message || err.message || 'Failed to join event with code';
+      setJoinModalError(errMsg);
+    } finally {
+      setJoiningCodeLoading(false);
+    }
+  };
+
   // 1-second live clock ticker for live overtime & countdown
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -54,11 +101,95 @@ const FreelancerPortal = ({ user }) => {
 
   useEffect(() => {
     loadPortalData();
+
+    // Listen for real-time socket events
+    const handleWaitlistPromoted = () => {
+      loadPortalData();
+    };
+    const handleGigJoined = () => {
+      loadPortalData();
+    };
+
+    window.addEventListener('waitlist:promoted', handleWaitlistPromoted);
+    window.addEventListener('gig:joined', handleGigJoined);
+
+    return () => {
+      window.removeEventListener('waitlist:promoted', handleWaitlistPromoted);
+      window.removeEventListener('gig:joined', handleGigJoined);
+    };
   }, []);
 
   const loadPortalData = async () => {
     try {
       setLoading(true);
+
+      // Single-RTT Unified GraphQL Query
+      try {
+        const data = await graphqlQuery(GET_FREELANCER_DASHBOARD);
+        const dash = data?.freelancerDashboard;
+
+        if (dash) {
+          setAssignedEvents(
+            dash.assignedGigs.map((g) => ({
+              _id: g.id,
+              uuid: g.uuid,
+              title: g.title,
+              eventCode: g.eventCode,
+              date: g.date,
+              startTime: g.startTime,
+              endTime: g.endTime,
+              location: { address: g.address },
+              sessionPay: g.sessionPay,
+              status: g.status,
+              attendanceTracking: g.attendanceTracking,
+              assignmentMode: g.assignmentMode,
+            }))
+          );
+          setOpenEvents(
+            dash.openGigs.map((g) => ({
+              _id: g.id,
+              uuid: g.uuid,
+              title: g.title,
+              eventCode: g.eventCode,
+              date: g.date,
+              startTime: g.startTime,
+              endTime: g.endTime,
+              location: { address: g.address },
+              sessionPay: g.sessionPay,
+              status: g.status,
+              attendanceTracking: g.attendanceTracking,
+              assignmentMode: g.assignmentMode,
+            }))
+          );
+          setEarnings({
+            totalPaid: dash.earnings?.totalPaid || 0,
+            pendingEarnings: dash.earnings?.pendingEarnings || 0,
+          });
+
+          const active = dash.activeAttendance
+            ? {
+                _id: dash.activeAttendance.id,
+                eventId: { _id: dash.activeAttendance.eventId, title: dash.activeAttendance.eventTitle },
+                status: dash.activeAttendance.status,
+                checkInAt: dash.activeAttendance.checkInAt,
+                checkOutAt: dash.activeAttendance.checkOutAt,
+                isExtended: dash.activeAttendance.isExtended,
+                actualMinutes: dash.activeAttendance.actualMinutes,
+                overtimeMinutes: dash.activeAttendance.overtimeMinutes,
+                overtimeStatus: dash.activeAttendance.overtimeStatus,
+              }
+            : null;
+          setActiveAttendance(active);
+          if (active?.isExtended) {
+            setIsOvertimeMode(true);
+          }
+          return;
+        }
+      } catch (gqlErr) {
+        console.warn('GraphQL query failed, falling back seamlessly to REST:', gqlErr);
+      }
+
+      // Seamless REST Fallback
       const [eventsRes, attRes, earningsRes] = await Promise.all([
         api.get('/events'),
         api.get('/attendance?limit=5'),
@@ -76,7 +207,6 @@ const FreelancerPortal = ({ user }) => {
         pendingEarnings: earningsRes.data.pendingEarnings || 0,
       });
 
-      // Find if currently checked in to any event
       const active = (attRes.data.attendance || []).find(
         (a) => a.status === 'checked_in' || a.status === 'manual_review'
       );
@@ -248,6 +378,29 @@ const FreelancerPortal = ({ user }) => {
     return () => clearInterval(interval);
   }, [activeAttendance, isOvertimeMode]);
 
+  // ─── 1-TAP SELF CHECK-IN (NO GPS / ZERO FRICTION) ──────────────────
+  const handleSimpleSelfCheckIn = async (event) => {
+    setGpsLoading(true);
+    setStatusMessage('Marking arrival...');
+    try {
+      const res = await api.post('/attendance/check-in', {
+        eventId: event._id,
+        latitude: event.location?.coordinates?.latitude || 0,
+        longitude: event.location?.coordinates?.longitude || 0,
+        accuracy: 10,
+        checkInMethod: 'manual',
+        notes: 'Self-reported arrival via 1-tap',
+      });
+      setStatusMessage(res.data.message || 'Arrival confirmed! Have a great shoot.');
+      setActiveAttendance(res.data.attendance);
+      loadPortalData();
+    } catch (err) {
+      setStatusMessage(err.response?.data?.message || 'Check-in failed');
+    } finally {
+      setGpsLoading(false);
+    }
+  };
+
   // ─── MANUAL GPS CHECK-IN ───────────────────────────────────────────
   const handleCheckIn = (event) => {
     if (!navigator.geolocation) {
@@ -286,10 +439,24 @@ const FreelancerPortal = ({ user }) => {
     );
   };
 
-  // ─── MANUAL GPS CHECK-OUT ──────────────────────────────────────────
+  // ─── CHECK-OUT HANDLER (1-TAP FOR SELF-REPORT / GPS FOR STRICT) ─────
   const handleCheckOut = (attendanceRecord) => {
-    if (!navigator.geolocation) {
-      alert('Geolocation is not supported by your browser.');
+    // 1-Tap instant checkout for freelancer_self or flat-rate shoots
+    if (attendanceRecord?.event?.attendancePolicy === 'freelancer_self' || !navigator.geolocation) {
+      setGpsLoading(true);
+      setStatusMessage('Wrapping shoot...');
+      setShowGraceModal(false);
+      api.post('/attendance/check-out', {
+        attendanceId: attendanceRecord._id,
+      }).then((res) => {
+        setStatusMessage(res.data.message || 'Shoot completed!');
+        setActiveAttendance(null);
+        loadPortalData();
+      }).catch((err) => {
+        setStatusMessage(err.response?.data?.message || 'Checkout failed');
+      }).finally(() => {
+        setGpsLoading(false);
+      });
       return;
     }
 
@@ -548,8 +715,38 @@ const FreelancerPortal = ({ user }) => {
     <div className="page-container">
       {/* HERO GPS SHIFT CARD */}
       <div className="freelancer-hero-card">
-        <h2>Hello, {user?.name}! 👋</h2>
-        <p>Your on-ground event workforce portal. Verify your shift presence using GPS.</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '14px' }}>
+          <div>
+            <h2 style={{ margin: 0 }}>Hello, {user?.name}! 👋</h2>
+            <p style={{ margin: '4px 0 0 0', opacity: 0.9 }}>Your on-ground event workforce portal. Join gigs via Event Code or verify presence.</p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-primary"
+            style={{
+              background: 'linear-gradient(135deg, #7C3AED 0%, #4F46E5 100%)',
+              border: '1.5px solid rgba(255,255,255,0.3)',
+              color: '#FFFFFF',
+              padding: '10px 18px',
+              fontSize: '0.92rem',
+              fontWeight: 700,
+              boxShadow: '0 4px 15px rgba(0, 0, 0, 0.25)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: 'pointer',
+              borderRadius: '8px',
+            }}
+            onClick={() => {
+              setShowJoinCodeModal(true);
+              setJoinCodeInput('');
+              setJoinModalError('');
+              setJoinModalSuccess('');
+            }}
+          >
+            🎟️ + Join Gig with Code
+          </button>
+        </div>
 
         {activeAttendance ? (
           <div className="active-shift-details">
@@ -639,13 +836,36 @@ const FreelancerPortal = ({ user }) => {
             </div>
 
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
-              <button
-                className="btn-checkout-large"
-                onClick={() => handleInitiateCheckOut(activeAttendance)}
-                disabled={gpsLoading || submittingOvertimeCheckout}
-              >
-                {gpsLoading ? 'Checking out...' : 'CHECK OUT NOW'}
-              </button>
+              {activeAttendance.event?.attendancePolicy === 'admin_managed' ? (
+                <div
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.15)',
+                    border: '1px solid rgba(255, 255, 255, 0.3)',
+                    padding: '10px 18px',
+                    borderRadius: '8px',
+                    textAlign: 'center',
+                  }}
+                >
+                  <span style={{ fontSize: '0.88rem', fontWeight: 700, color: '#A7F3D0', display: 'block' }}>
+                    🟢 Marked Present by Studio
+                  </span>
+                  <span style={{ fontSize: '0.74rem', color: '#E2E8F0' }}>
+                    Shift in progress. Studio admin will mark your shoot wrapped.
+                  </span>
+                </div>
+              ) : (
+                <button
+                  className="btn-checkout-large"
+                  onClick={() => handleInitiateCheckOut(activeAttendance)}
+                  disabled={gpsLoading || submittingOvertimeCheckout}
+                >
+                  {gpsLoading
+                    ? 'Checking out...'
+                    : activeAttendance.event?.attendancePolicy === 'freelancer_self'
+                    ? '🏁 WRAP SHOOT (1-TAP)'
+                    : 'CHECK OUT NOW'}
+                </button>
+              )}
             </div>
           </div>
         ) : currentEvent ? (
@@ -653,31 +873,99 @@ const FreelancerPortal = ({ user }) => {
             <div>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
                 <span className="badge badge-open">Upcoming Assigned Shift</span>
-                <span className={`badge ${gateInfo?.isUnlocked ? 'badge-verified' : 'badge-alert'}`}>
-                  {gateInfo?.message}
-                </span>
+                {currentEvent.attendanceTracking === false ? (
+                  <span className="badge" style={{ background: '#059669', color: '#fff', fontWeight: 600 }}>
+                    🟢 Confirmed • Flat Pay (No GPS required)
+                  </span>
+                ) : (
+                  <span className={`badge ${gateInfo?.isUnlocked ? 'badge-verified' : 'badge-alert'}`}>
+                    {gateInfo?.message}
+                  </span>
+                )}
+                {currentEvent.eventCode && (
+                  <span className="badge" style={{ background: '#EEF2FF', color: '#4F46E5', fontWeight: 700 }}>
+                    🎟️ {currentEvent.eventCode}
+                  </span>
+                )}
               </div>
               <h3 style={{ fontSize: '1.25rem', fontWeight: 700 }}>{currentEvent.title}</h3>
               <p style={{ fontSize: '0.88rem', color: '#E9D5FF' }}>
                 📍 {currentEvent.location?.address} | {currentEvent.startTime} - {currentEvent.endTime}
               </p>
               <p style={{ fontSize: '0.82rem', color: '#D8B4FE', marginTop: '4px' }}>
-                Pay: ₹{currentEvent.sessionPay} | Geofence Radius: {currentEvent.location?.radius || 150}m
+                Pay: ₹{currentEvent.sessionPay} {currentEvent.attendanceTracking !== false ? `| Geofence Radius: ${currentEvent.location?.radius || 150}m` : '| Flat Rate Shoot'}
               </p>
             </div>
 
-            <button
-              className="btn-checkin-large"
-              onClick={() => handleCheckIn(currentEvent)}
-              disabled={gpsLoading || !gateInfo?.isUnlocked}
-              style={{
-                opacity: !gateInfo?.isUnlocked ? 0.6 : 1,
-                cursor: !gateInfo?.isUnlocked ? 'not-allowed' : 'pointer',
-              }}
-              title={!gateInfo?.isUnlocked ? gateInfo?.message : 'Click to check in via GPS'}
-            >
-              {gpsLoading ? 'Verifying GPS...' : gateInfo?.isUnlocked ? '📍 GPS CHECK IN' : '🔒 CHECK-IN LOCKED'}
-            </button>
+            {/* Adaptive Shift Action Controls Based on Admin Policy */}
+            {currentEvent.attendancePolicy === 'admin_managed' || (!currentEvent.attendancePolicy && currentEvent.attendanceTracking !== false) ? (
+              <div
+                style={{
+                  background: 'rgba(255, 255, 255, 0.12)',
+                  border: '1px solid rgba(255, 255, 255, 0.25)',
+                  padding: '14px 20px',
+                  borderRadius: '8px',
+                  textAlign: 'center',
+                }}
+              >
+                <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#FEF08A', display: 'block' }}>
+                  👔 Attendance Managed by Studio Admin
+                </span>
+                <span style={{ fontSize: '0.78rem', color: '#E2E8F0', display: 'block', marginTop: '4px' }}>
+                  You will be marked present on-site at the venue by your studio lead. Zero app check-in needed.
+                </span>
+              </div>
+            ) : currentEvent.attendancePolicy === 'freelancer_self' ? (
+              <button
+                className="btn-checkin-large"
+                onClick={() => handleSimpleSelfCheckIn(currentEvent)}
+                disabled={gpsLoading || !gateInfo?.isUnlocked}
+                style={{
+                  background: 'linear-gradient(135deg, #10B981 0%, #059669 100%)',
+                  opacity: !gateInfo?.isUnlocked ? 0.6 : 1,
+                  cursor: !gateInfo?.isUnlocked ? 'not-allowed' : 'pointer',
+                  border: 'none',
+                  padding: '14px 24px',
+                  borderRadius: '8px',
+                  fontWeight: 700,
+                  fontSize: '0.95rem',
+                  color: '#fff',
+                }}
+                title={!gateInfo?.isUnlocked ? gateInfo?.message : 'Click to confirm arrival (no GPS check)'}
+              >
+                {gpsLoading ? 'Confirming...' : gateInfo?.isUnlocked ? '📱 I HAVE ARRIVED (1-TAP)' : '🔒 CHECK-IN LOCKED'}
+              </button>
+            ) : currentEvent.attendancePolicy === 'strict_geofence' ? (
+              <button
+                className="btn-checkin-large"
+                onClick={() => handleCheckIn(currentEvent)}
+                disabled={gpsLoading || !gateInfo?.isUnlocked}
+                style={{
+                  opacity: !gateInfo?.isUnlocked ? 0.6 : 1,
+                  cursor: !gateInfo?.isUnlocked ? 'not-allowed' : 'pointer',
+                }}
+                title={!gateInfo?.isUnlocked ? gateInfo?.message : 'Click to check in via GPS'}
+              >
+                {gpsLoading ? 'Verifying GPS...' : gateInfo?.isUnlocked ? '📍 GPS CHECK IN' : '🔒 CHECK-IN LOCKED'}
+              </button>
+            ) : (
+              <div
+                style={{
+                  background: 'rgba(255, 255, 255, 0.12)',
+                  border: '1px solid rgba(255, 255, 255, 0.25)',
+                  padding: '12px 18px',
+                  borderRadius: '8px',
+                  textAlign: 'center',
+                }}
+              >
+                <span style={{ fontSize: '0.88rem', fontWeight: 700, color: '#A7F3D0', display: 'block' }}>
+                  🤝 Flat-Rate Shoot Confirmed
+                </span>
+                <span style={{ fontSize: '0.76rem', color: '#E2E8F0', display: 'block', marginTop: '2px' }}>
+                  No GPS check-in required. Coordinate directly with your event organizer.
+                </span>
+              </div>
+            )}
           </div>
         ) : (
           <div className="active-shift-details">
@@ -738,6 +1026,102 @@ const FreelancerPortal = ({ user }) => {
             <span className="kpi-value" style={{ fontSize: '1.1rem' }}>Phone Dead / No GPS?</span>
             <span className="kpi-sub">Submit manual attendance request &rarr;</span>
           </div>
+        </div>
+      </div>
+
+      {/* MY BOOKED GIGS & SCHEDULE */}
+      <div className="table-card" style={{ marginBottom: '24px' }}>
+        <div className="table-header-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span className="table-header-title">My Booked Gigs & Schedule ({assignedEvents.length})</span>
+          <button
+            className="btn btn-sm"
+            style={{
+              background: '#EEF2FF',
+              color: '#4F46E5',
+              border: '1px solid #C7D2FE',
+              fontWeight: 600,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              cursor: 'pointer',
+              borderRadius: '6px',
+              padding: '4px 10px',
+            }}
+            onClick={() => {
+              setShowJoinCodeModal(true);
+              setJoinCodeInput('');
+              setJoinModalError('');
+              setJoinModalSuccess('');
+            }}
+          >
+            🎟️ + Join with Code
+          </button>
+        </div>
+        <div className="data-table-wrapper">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Event Title</th>
+                <th>Date & Shift</th>
+                <th>Venue Location</th>
+                <th>Tracking Mode</th>
+                <th>Session Pay</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {assignedEvents.length === 0 ? (
+                <tr>
+                  <td colSpan="6" style={{ textAlign: 'center', padding: '28px', color: '#64748B' }}>
+                    No gigs booked yet. Enter an Event Code shared by your studio or apply for open shifts below.
+                  </td>
+                </tr>
+              ) : (
+                assignedEvents.map((ev) => (
+                  <tr key={ev._id}>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                        <strong style={{ color: '#0F172A' }}>{ev.title}</strong>
+                        {ev.eventCode && (
+                          <span className="badge" style={{ background: '#EEF2FF', color: '#4F46E5', fontSize: '0.72rem', fontWeight: 700 }}>
+                            {ev.eventCode}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td>
+                      <div>{new Date(ev.date).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' })}</div>
+                      <span style={{ fontSize: '0.78rem', color: '#64748B' }}>
+                        {ev.startTime} - {ev.endTime}
+                      </span>
+                    </td>
+                    <td>📍 {ev.location?.address}</td>
+                    <td>
+                      {ev.attendancePolicy === 'admin_managed' ? (
+                        <span className="badge" style={{ background: '#FEF3C7', color: '#92400E', fontWeight: 600 }}>
+                          👔 Studio Managed
+                        </span>
+                      ) : ev.attendancePolicy === 'freelancer_self' ? (
+                        <span className="badge" style={{ background: '#ECFDF5', color: '#065F46', fontWeight: 600 }}>
+                          📱 1-Tap Self
+                        </span>
+                      ) : ev.attendancePolicy === 'strict_geofence' ? (
+                        <span className="badge badge-open">📍 GPS (150m)</span>
+                      ) : (
+                        <span className="badge" style={{ background: '#F1F5F9', color: '#475569', fontWeight: 600 }}>
+                          ⚪ Flat Pay
+                        </span>
+                      )}
+                    </td>
+                    <td>₹{ev.sessionPay}</td>
+                    <td>
+                      <span className="badge badge-verified">Confirmed</span>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -1155,6 +1539,132 @@ const FreelancerPortal = ({ user }) => {
                 </button>
                 <button type="submit" className="btn btn-primary">
                   Submit Request
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* JOIN GIG WITH EVENT CODE MODAL */}
+      {showJoinCodeModal && (
+        <div className="modal-overlay" style={{ background: 'rgba(15, 23, 42, 0.75)' }}>
+          <div className="modal-card" style={{ maxWidth: '480px' }}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '1.4rem' }}>🎟️</span>
+                <div>
+                  <h3 style={{ margin: 0 }}>Join Gig with Event Code</h3>
+                  <span style={{ fontSize: '0.78rem', color: '#64748B' }}>
+                    Instant crew assignment via 6-character code
+                  </span>
+                </div>
+              </div>
+              <button
+                className="modal-close"
+                onClick={() => {
+                  setShowJoinCodeModal(false);
+                  setJoinCodeInput('');
+                  setJoinModalError('');
+                  setJoinModalSuccess('');
+                }}
+              >
+                &times;
+              </button>
+            </div>
+
+            <form onSubmit={handleJoinGigByCode}>
+              <div className="modal-body">
+                {joinModalError && (
+                  <div
+                    className="auth-alert"
+                    style={{
+                      marginBottom: '14px',
+                      background: '#FEF2F2',
+                      border: '1px solid #FCA5A5',
+                      color: '#991B1B',
+                      padding: '10px 14px',
+                      borderRadius: '8px',
+                      fontSize: '0.86rem',
+                    }}
+                  >
+                    ⚠️ {joinModalError}
+                  </div>
+                )}
+
+                {joinModalSuccess && (
+                  <div
+                    style={{
+                      marginBottom: '14px',
+                      background: '#F0FDF4',
+                      border: '1px solid #86EFAC',
+                      color: '#166534',
+                      padding: '12px 14px',
+                      borderRadius: '8px',
+                      fontSize: '0.88rem',
+                      fontWeight: 600,
+                    }}
+                  >
+                    🎉 {joinModalSuccess}
+                  </div>
+                )}
+
+                <div className="form-group">
+                  <label style={{ fontSize: '0.88rem', fontWeight: 700, color: '#0F172A' }}>
+                    Event Code *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={10}
+                    value={joinCodeInput}
+                    placeholder="e.g. EVT-8K2"
+                    onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                    style={{
+                      fontSize: '1.3rem',
+                      fontWeight: 800,
+                      letterSpacing: '2px',
+                      textTransform: 'uppercase',
+                      textAlign: 'center',
+                      padding: '12px',
+                      borderRadius: '8px',
+                      border: '2px solid #CBD5E1',
+                      outline: 'none',
+                    }}
+                    autoFocus
+                  />
+                  <small style={{ color: '#64748B', fontSize: '0.78rem', marginTop: '6px', display: 'block' }}>
+                    Enter the 6-character event code shared by your studio manager or WhatsApp group (e.g., EVT-8K2).
+                  </small>
+                </div>
+              </div>
+
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setShowJoinCodeModal(false);
+                    setJoinCodeInput('');
+                    setJoinModalError('');
+                    setJoinModalSuccess('');
+                  }}
+                  disabled={joiningCodeLoading}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={joiningCodeLoading || !joinCodeInput.trim()}
+                  style={{
+                    background: 'linear-gradient(135deg, #7C3AED 0%, #4F46E5 100%)',
+                    border: 'none',
+                    padding: '10px 20px',
+                    fontWeight: 700,
+                  }}
+                >
+                  {joiningCodeLoading ? 'Verifying...' : 'Join Gig Now &rarr;'}
                 </button>
               </div>
             </form>

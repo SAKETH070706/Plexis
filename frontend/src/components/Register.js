@@ -11,6 +11,7 @@ const Register = ({ onRegister, onSwitchToLogin }) => {
     role: 'admin',
     organizationName: '',
     studioCode: '',
+    eventCode: '',
     phone: '',
   });
   const [error, setError] = useState('');
@@ -44,14 +45,25 @@ const Register = ({ onRegister, onSwitchToLogin }) => {
       return;
     }
 
-    if (formData.role === 'freelancer' && !formData.studioCode.trim()) {
-      setError('Please enter your Studio Code or Organization ID to join');
-      return;
-    }
-
     setLoading(true);
     try {
-      const res = await api.post('/auth/register', formData);
+      const payload = {
+        name: formData.name.trim(),
+        email: formData.email.trim().toLowerCase(),
+        password: formData.password,
+        role: formData.role,
+        phone: formData.phone.trim(),
+      };
+
+      if (formData.role === 'admin') {
+        payload.organizationName = formData.organizationName?.trim() || '';
+        if (formData.studioCode?.trim()) payload.studioCode = formData.studioCode.trim().toUpperCase();
+      } else if (formData.role === 'freelancer') {
+        if (formData.eventCode?.trim()) payload.eventCode = formData.eventCode.trim().toUpperCase();
+        if (formData.studioCode?.trim()) payload.studioCode = formData.studioCode.trim().toUpperCase();
+      }
+
+      const res = await api.post('/auth/register', payload);
       const { token, user } = res.data;
 
       localStorage.setItem('token', token);
@@ -154,23 +166,37 @@ const Register = ({ onRegister, onSwitchToLogin }) => {
           )}
 
           {formData.role === 'freelancer' && (
-            <div className="form-group" style={{ marginBottom: '20px' }}>
-              <label>
-                Studio Code or Organization ID (ask your studio owner) <span style={{ color: '#ef4444' }}>*</span>
-              </label>
-              <input
-                type="text"
-                name="studioCode"
-                required
-                placeholder="e.g. STU-7K9A"
-                value={formData.studioCode}
-                onChange={handleChange}
-                style={{ textTransform: 'uppercase', letterSpacing: '1px' }}
-              />
-              <small style={{ color: '#64748B', fontSize: '0.78rem', marginTop: '4px', display: 'block' }}>
-                Your studio admin can find their 6-character Studio Code in their Plexis top bar or overview tab.
-              </small>
-            </div>
+            <>
+              <div className="form-group" style={{ marginBottom: '14px' }}>
+                <label>Have an Event Code? (Optional)</label>
+                <input
+                  type="text"
+                  name="eventCode"
+                  placeholder="e.g. EVT-8K2"
+                  value={formData.eventCode}
+                  onChange={(e) => setFormData({ ...formData, eventCode: e.target.value.toUpperCase() })}
+                  style={{ textTransform: 'uppercase', letterSpacing: '1.5px', fontWeight: 600 }}
+                />
+                <small style={{ color: '#64748B', fontSize: '0.78rem', marginTop: '4px', display: 'block' }}>
+                  Received an invite on WhatsApp? Enter the code to auto-join the gig immediately upon registration!
+                </small>
+              </div>
+
+              <div className="form-group" style={{ marginBottom: '20px' }}>
+                <label>Studio Code (Optional)</label>
+                <input
+                  type="text"
+                  name="studioCode"
+                  placeholder="e.g. STU-7K9A"
+                  value={formData.studioCode}
+                  onChange={(e) => setFormData({ ...formData, studioCode: e.target.value.toUpperCase() })}
+                  style={{ textTransform: 'uppercase', letterSpacing: '1px' }}
+                />
+                <small style={{ color: '#64748B', fontSize: '0.78rem', marginTop: '4px', display: 'block' }}>
+                  Leave blank if you work as an independent contractor across multiple studios.
+                </small>
+              </div>
+            </>
           )}
 
           <button

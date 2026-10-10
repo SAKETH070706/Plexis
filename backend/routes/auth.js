@@ -30,7 +30,7 @@ const signToken = (user) => {
 
 // ── Register new user ────────────────────────────────────────────────
 router.post('/register', authLimiter, async (req, res) => {
-  const { name, email, password, role, organizationName, organizationId, studioCode, phone } = req.body;
+  const { name, email, password, role, organizationName, organizationId, studioCode, phone, eventCode } = req.body;
 
   if (!name || typeof name !== 'string' || name.trim().length < 2) {
     return res.status(400).json({ message: 'Name must be at least 2 characters long' });
@@ -54,6 +54,20 @@ router.post('/register', authLimiter, async (req, res) => {
     const normalizedEmail = email.trim().toLowerCase();
     const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) return res.status(400).json({ message: 'User already exists' });
+
+    // If eventCode provided during registration, validate event existence upfront
+    let targetEvent = null;
+    if (eventCode) {
+      const cleanEventCode = String(eventCode).trim().toUpperCase();
+      const Event = require('../models/Event');
+      targetEvent = await Event.findOne({ eventCode: cleanEventCode });
+      if (!targetEvent) {
+        return res.status(404).json({ message: 'Invalid Event Code' });
+      }
+      if (targetEvent.status === 'cancelled' || targetEvent.status === 'completed') {
+        return res.status(400).json({ message: 'Cannot join an inactive or completed event' });
+      }
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const assignedRole = role || 'user';
@@ -95,7 +109,7 @@ router.post('/register', authLimiter, async (req, res) => {
         user.organizationId = newOrg._id;
       }
     } else if (assignedRole === 'freelancer') {
-      // Freelancer must join via studioCode or organizationId
+      // Independent freelancers: studioCode/organizationId are completely optional
       let targetOrg = null;
       if (studioCode) {
         const cleanInput = studioCode.trim().toUpperCase();
@@ -122,16 +136,12 @@ router.post('/register', authLimiter, async (req, res) => {
         }
       }
 
-      if (!targetOrg) {
-        // Fallback: If only 1 organization exists in the system or if none provided for test
-        const totalOrgs = await Organization.countDocuments();
-        if (totalOrgs === 1) {
-          targetOrg = await Organization.findOne();
-        } else {
-          return res.status(404).json({ message: 'Invalid Studio Code / Organization ID' });
-        }
+      // If studioCode was provided but not found, return 404
+      if (studioCode && !targetOrg) {
+        return res.status(404).json({ message: 'Invalid Studio Code / Organization ID' });
       }
-      user.organizationId = targetOrg._id;
+
+      user.organizationId = targetOrg ? targetOrg._id : null;
     } else {
       // Legacy 'user' role
       let defaultOrg = await Organization.findOne();
@@ -147,20 +157,35 @@ router.post('/register', authLimiter, async (req, res) => {
 
     await user.save();
 
-    const token = signToken(user);
-    const org = await Organization.findById(user.organizationId);
+    let joinResult = null;
+    if (eventCode && targetEvent) {
+      const { joinEventByCode } = require('./events');
+      joinResult = await joinEventByCode(user, targetEvent.eventCode, req);
+    }
 
-    res.status(201).json({
+    const token = signToken(user);
+    const org = user.organizationId ? await Organization.findById(user.organizationId) : null;
+
+    const responsePayload = {
       token,
       user: {
         id: user._id,
+        uuid: user.uuid,
         name: user.name,
         email: user.email,
         role: user.role,
         organizationId: user.organizationId,
         organization: org ? { id: org._id, name: org.name, studioCode: org.studioCode } : null,
       },
-    });
+    };
+
+    if (joinResult && joinResult.data) {
+      responsePayload.assignment = joinResult.data.assignment;
+      responsePayload.isWaitlisted = joinResult.data.isWaitlisted;
+      responsePayload.message = joinResult.data.message;
+    }
+
+    res.status(201).json(responsePayload);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -177,29 +202,24 @@ router.post('/login', authLimiter, async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
 
-    // Backwards-compatibility check: ensure user has an organization
-    if (!user.organizationId) {
-      if (user.role === 'admin') {
-        let org = await Organization.findOne({ ownerId: user._id });
-        if (!org) {
-          org = new Organization({
-            name: `${user.name}'s Organization`,
-            ownerId: user._id,
-          });
-          await org.save();
-        }
-        user.organizationId = org._id;
-      } else {
-        let org = await Organization.findOne();
-        if (!org) {
-          org = new Organization({
-            name: 'Main Studio Organization',
-            ownerId: user._id,
-          });
-          await org.save();
-        }
-        user.organizationId = org._id;
+    // Backwards-compatibility check: ensure admin has an organization
+    if (!user.organizationId && user.role === 'admin') {
+      let org = await Organization.findOne({ ownerId: user._id });
+      if (!org) {
+        org = new Organization({
+          name: `${user.name}'s Organization`,
+          ownerId: user._id,
+        });
+        await org.save();
       }
+      user.organizationId = org._id;
+      await user.save();
+    }
+
+    // Ensure uuid exists on legacy user documents
+    if (!user.uuid) {
+      const { v4: uuidv4 } = require('uuid');
+      user.uuid = uuidv4();
       await user.save();
     }
 
@@ -231,18 +251,19 @@ router.post('/login', authLimiter, async (req, res) => {
         }
       }
 
-      if (!specifiedOrg || specifiedOrg._id.toString() !== user.organizationId.toString()) {
+      if (user.organizationId && (!specifiedOrg || specifiedOrg._id.toString() !== user.organizationId.toString())) {
         return res.status(403).json({ message: 'Access denied: You do not belong to this studio' });
       }
     }
 
     const token = signToken(user);
-    const org = await Organization.findById(user.organizationId);
+    const org = user.organizationId ? await Organization.findById(user.organizationId) : null;
 
     res.json({
       token,
       user: {
         id: user._id,
+        uuid: user.uuid,
         name: user.name,
         email: user.email,
         role: user.role,

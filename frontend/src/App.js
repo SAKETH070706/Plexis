@@ -145,6 +145,20 @@ function App() {
       showToast(`💰 Payout of ₹${data.totalAmount} approved!`);
     });
 
+    socket.on('gig:joined', (data) => {
+      const name = data.freelancer?.name || 'A crew member';
+      const eventTitle = data.event?.title || 'an event';
+      const statusText = data.isWaitlisted ? 'added to waitlist for' : 'joined';
+      showToast(`🎟️ ${name} ${statusText} "${eventTitle}"!`);
+      window.dispatchEvent(new CustomEvent('gig:joined', { detail: data }));
+    });
+
+    socket.on('waitlist:promoted', (data) => {
+      const eventTitle = data.eventTitle || 'your event';
+      showToast(`🚀 Great news! You've been promoted from the waitlist to Confirmed Crew for "${eventTitle}"!`);
+      window.dispatchEvent(new CustomEvent('waitlist:promoted', { detail: data }));
+    });
+
     socket.on('attendanceRequestCreated', (data) => {
       showToast('⚠️ New manual attendance exception request submitted');
       window.dispatchEvent(new CustomEvent('attendance:update', { detail: data }));

@@ -8,9 +8,44 @@ const { isValidPhone, formatPhone, escapeRegex } = require('../utils/validators'
 
 const router = express.Router();
 
+// Helpers for date and time calculations
+function timeToMinutes(timeStr) {
+  if (!timeStr) return 0;
+  const [h, m] = timeStr.split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+function isTimeOverlapping(startA, endA, startB, endB) {
+  const sA = timeToMinutes(startA);
+  const eA = timeToMinutes(endA);
+  const sB = timeToMinutes(startB);
+  const eB = timeToMinutes(endB);
+  return Math.max(sA, sB) < Math.min(eA, eB);
+}
+
+function isSameCalendarDate(d1, d2) {
+  const a = new Date(d1);
+  const b = new Date(d2);
+  return a.toISOString().slice(0, 10) === b.toISOString().slice(0, 10);
+}
+
+async function generateUniqueEventCode() {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  for (let attempt = 0; attempt < 25; attempt++) {
+    let code = 'EVT-';
+    for (let i = 0; i < 3; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    const exists = await Event.findOne({ eventCode: code });
+    if (!exists) return code;
+  }
+  const crypto = require('crypto');
+  return 'EVT-' + crypto.randomBytes(2).toString('hex').toUpperCase().slice(0, 3);
+}
+
 // Helper to emit events to specific rooms
 function emitSocket(req, eventName, payload, targetRoom = null) {
-  const io = req.app.get('io');
+  const io = req?.app?.get ? req.app.get('io') : null;
   if (!io) return;
   const orgId = req.user?.organizationId;
   if (targetRoom && targetRoom !== 'admin') {
@@ -22,6 +57,150 @@ function emitSocket(req, eventName, payload, targetRoom = null) {
     io.to('admin').emit(eventName, payload);
   }
 }
+
+// ─── REUSABLE AUTONOMOUS EVENT JOIN PIPELINE ─────────────────────────
+async function joinEventByCode(user, eventCode, req = null) {
+  if (!eventCode || typeof eventCode !== 'string') {
+    return { status: 404, message: 'Invalid Event Code' };
+  }
+
+  const cleanCode = eventCode.trim().toUpperCase();
+  const event = await Event.findOne({ eventCode: cleanCode });
+  if (!event) {
+    return { status: 404, message: 'Invalid Event Code' };
+  }
+
+  // Event status check
+  if (event.status === 'cancelled' || event.status === 'completed') {
+    return { status: 400, message: 'Cannot join an inactive or completed event' };
+  }
+
+  const userId = user._id || user.id;
+
+  // Duplicate Check
+  const existing = await Assignment.findOne({
+    eventId: event._id,
+    freelancerId: userId,
+  });
+
+  if (existing && ['assigned', 'accepted', 'waitlist'].includes(existing.status)) {
+    return { status: 400, message: 'You are already registered for this event' };
+  }
+
+  // Schedule Conflict / Anti-Double-Booking Protection
+  const activeAssignments = await Assignment.find({
+    freelancerId: userId,
+    status: { $in: ['assigned', 'accepted'] },
+  }).populate('eventId');
+
+  for (const asgn of activeAssignments) {
+    const existingEvent = asgn.eventId;
+    if (!existingEvent) continue;
+    if (existingEvent._id.toString() === event._id.toString()) continue;
+    if (existingEvent.status === 'cancelled') continue;
+
+    if (isSameCalendarDate(existingEvent.date, event.date)) {
+      if (isTimeOverlapping(event.startTime, event.endTime, existingEvent.startTime, existingEvent.endTime)) {
+        return {
+          status: 409,
+          message: `Schedule Conflict: You are already booked for '${existingEvent.title}' on this date from ${existingEvent.startTime} to ${existingEvent.endTime}.`,
+        };
+      }
+    }
+  }
+
+  // Capacity & Waitlist Logic
+  const activeCount = await Assignment.countDocuments({
+    eventId: event._id,
+    status: { $in: ['assigned', 'accepted'] },
+  });
+
+  const isWaitlisted = activeCount >= event.requiredWorkers;
+  const assignmentStatus = isWaitlisted ? 'waitlist' : 'assigned';
+  const message = isWaitlisted
+    ? 'Event slots are full. You have been added to the Priority Waitlist as a backup crew member.'
+    : 'Joined event successfully! Shift confirmed.';
+  const httpStatus = isWaitlisted ? 200 : 201;
+
+  let assignment = existing;
+  if (assignment) {
+    assignment.status = assignmentStatus;
+    assignment.joinedVia = 'event_code';
+    assignment.eventCode = event.eventCode;
+    assignment.eventTitle = event.title;
+    assignment.eventDate = event.date;
+    assignment.sessionPay = event.sessionPay || 0;
+    assignment.updatedAt = new Date();
+    await assignment.save();
+  } else {
+    assignment = new Assignment({
+      organizationId: event.organizationId,
+      eventId: event._id,
+      freelancerId: userId,
+      status: assignmentStatus,
+      joinedVia: 'event_code',
+      eventCode: event.eventCode,
+      eventTitle: event.title,
+      eventDate: event.date,
+      sessionPay: event.sessionPay || 0,
+    });
+    await assignment.save();
+  }
+
+  if (req) {
+    const io = req?.app?.get ? req.app.get('io') : null;
+    const orgId = event.organizationId ? event.organizationId.toString() : null;
+    const socketPayload = {
+      event: {
+        _id: event._id,
+        uuid: event.uuid,
+        title: event.title,
+        eventCode: event.eventCode,
+        date: event.date,
+        startTime: event.startTime,
+        endTime: event.endTime,
+        requiredWorkers: event.requiredWorkers,
+      },
+      assignment,
+      freelancer: { id: userId, name: user.name, email: user.email },
+      isWaitlisted,
+    };
+    if (io) {
+      if (orgId) {
+        io.to(`admin:${orgId}`).emit('gig:joined', socketPayload);
+        io.to(`org:${orgId}`).emit('gig:joined', socketPayload);
+      }
+      io.to('admin').emit('gig:joined', socketPayload);
+    }
+    emitSocket(req, isWaitlisted ? 'crewWaitlisted' : 'crewJoined', socketPayload);
+  }
+
+  return {
+    status: httpStatus,
+    data: {
+      message,
+      assignment,
+      isWaitlisted,
+    },
+  };
+}
+
+// ─── 0. AUTONOMOUS EVENT JOIN (Freelancer) ───────────────────────────
+router.post('/join', auth, async (req, res) => {
+  try {
+    const { eventCode } = req.body;
+    if (!eventCode) {
+      return res.status(404).json({ message: 'Invalid Event Code' });
+    }
+    const result = await joinEventByCode(req.user, eventCode, req);
+    if (result.status >= 400) {
+      return res.status(result.status).json({ message: result.message });
+    }
+    return res.status(result.status).json(result.data);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ─── 1. CREATE EVENT (Admin Only) ────────────────────────────────────
 router.post('/', adminAuth, async (req, res) => {
@@ -41,6 +220,9 @@ router.post('/', adminAuth, async (req, res) => {
       overtimeRate,
       travelAllowance,
       assignmentMode,
+      attendanceTracking,
+      attendancePolicy,
+      eventCode: customEventCode,
     } = req.body;
 
     // Validate location and geofence inputs
@@ -74,8 +256,17 @@ router.post('/', adminAuth, async (req, res) => {
       return res.status(400).json({ message: 'Travel allowance cannot be negative' });
     }
 
+    const eventCode = customEventCode
+      ? customEventCode.trim().toUpperCase()
+      : await generateUniqueEventCode();
+
+    const resolvedPolicy = attendancePolicy || (attendanceTracking === false ? 'none' : 'admin_managed');
+
     const event = new Event({
       organizationId: req.user.organizationId,
+      eventCode,
+      attendancePolicy: resolvedPolicy,
+      attendanceTracking: resolvedPolicy !== 'none',
       title: title.trim(),
       description: description ? description.trim() : '',
       leadId: leadId || null,
@@ -120,35 +311,42 @@ router.post('/', adminAuth, async (req, res) => {
 router.get('/', auth, async (req, res) => {
   try {
     const { status, search, mode, page = 1, limit = 20 } = req.query;
-    const query = { organizationId: req.user.organizationId };
+    let query = {};
+
+    if (req.user.role === 'admin') {
+      query.organizationId = req.user.organizationId;
+    } else {
+      // Freelancer sees:
+      // 1. Events where they are assigned/applied/waitlisted across any studio
+      // 2. Open upcoming events in their associated studio (if any)
+      const myAssignments = await Assignment.find({
+        freelancerId: req.user.id,
+        status: { $in: ['assigned', 'applied', 'accepted', 'waitlist'] },
+      }).select('eventId');
+
+      const myEventIds = myAssignments.map((a) => a.eventId);
+      const orClauses = [{ _id: { $in: myEventIds } }];
+      if (req.user.organizationId) {
+        orClauses.push({ organizationId: req.user.organizationId, assignmentMode: 'open', status: 'upcoming' });
+      }
+      query.$or = orClauses;
+    }
 
     if (status) query.status = status;
     if (mode) query.assignmentMode = mode;
     if (search) {
       const safeSearch = escapeRegex(String(search).trim());
-      query.$or = [
+      const searchOr = [
         { title: { $regex: safeSearch, $options: 'i' } },
         { clientName: { $regex: safeSearch, $options: 'i' } },
         { 'location.address': { $regex: safeSearch, $options: 'i' } },
       ];
-    }
-
-    // Role-based visibility
-    if (req.user.role !== 'admin') {
-      // Freelancer sees:
-      // 1. Events where they are assigned/applied
-      // 2. Open events that are upcoming
-      const myAssignments = await Assignment.find({
-        freelancerId: req.user.id,
-        status: { $in: ['assigned', 'applied', 'accepted'] },
-      }).select('eventId');
-
-      const myEventIds = myAssignments.map((a) => a.eventId);
-
-      query.$or = [
-        { _id: { $in: myEventIds } },
-        { assignmentMode: 'open', status: 'upcoming' },
-      ];
+      if (query.$or) {
+        query.$and = [{ $or: query.$or }, { $or: searchOr }];
+        delete query.$or;
+      } else {
+        query.$or = searchOr;
+      }
     }
 
     const skip = (page - 1) * limit;
@@ -208,12 +406,24 @@ router.get('/', auth, async (req, res) => {
 // ─── 3. GET SINGLE EVENT ─────────────────────────────────────────────
 router.get('/:id', auth, async (req, res) => {
   try {
-    const event = await Event.findOne({
-      _id: req.params.id,
-      organizationId: req.user.organizationId,
-    }).populate('leadId', 'name email phone status');
+    const event = await Event.findById(req.params.id).populate('leadId', 'name email phone status');
 
     if (!event) return res.status(404).json({ message: 'Event not found' });
+
+    if (req.user.role === 'admin') {
+      if (event.organizationId.toString() !== req.user.organizationId?.toString()) {
+        return res.status(404).json({ message: 'Event not found' });
+      }
+    } else {
+      const assignment = await Assignment.findOne({
+        eventId: event._id,
+        freelancerId: req.user.id,
+      });
+      const isMyOrgOpen = req.user.organizationId && event.organizationId.toString() === req.user.organizationId.toString() && event.assignmentMode === 'open';
+      if (!assignment && !isMyOrgOpen) {
+        return res.status(404).json({ message: 'Event not found' });
+      }
+    }
 
     // Fetch assignments for this event
     const assignments = await Assignment.find({ eventId: event._id })
@@ -294,6 +504,7 @@ router.put('/:id', adminAuth, async (req, res) => {
       'clientName',
       'assignmentMode',
       'status',
+      'attendancePolicy',
     ];
 
     simpleFields.forEach((field) => {
@@ -301,6 +512,13 @@ router.put('/:id', adminAuth, async (req, res) => {
         event[field] = req.body[field];
       }
     });
+
+    if (req.body.attendancePolicy !== undefined) {
+      event.attendanceTracking = req.body.attendancePolicy !== 'none';
+    } else if (req.body.attendanceTracking !== undefined) {
+      event.attendanceTracking = Boolean(req.body.attendanceTracking);
+      if (!req.body.attendanceTracking) event.attendancePolicy = 'none';
+    }
 
     if (req.body.location) {
       if (req.body.location.address) event.location.address = req.body.location.address;
@@ -391,7 +609,8 @@ router.post('/:id/assign', adminAuth, async (req, res) => {
       if (['assigned', 'accepted'].includes(existing.status)) {
         return res.status(400).json({ message: 'Freelancer is already assigned to this event' });
       }
-      // Re-activate if was previously cancelled or applied
+      // Re-activate if was previously cancelled, applied, or on waitlist
+      const wasWaitlist = existing.status === 'waitlist';
       existing.status = 'assigned';
       existing.assignedBy = req.user.id;
       existing.notes = notes || existing.notes;
@@ -399,6 +618,17 @@ router.post('/:id/assign', adminAuth, async (req, res) => {
       await existing.save();
 
       emitSocket(req, 'assignmentCreated', existing, freelancerId.toString());
+      if (wasWaitlist) {
+        const io = req?.app?.get ? req.app.get('io') : null;
+        if (io) {
+          io.to(freelancerId.toString()).emit('waitlist:promoted', {
+            eventId: event._id,
+            eventCode: event.eventCode,
+            eventTitle: event.title,
+            assignment: existing,
+          });
+        }
+      }
       return res.json(existing);
     }
 
@@ -407,6 +637,11 @@ router.post('/:id/assign', adminAuth, async (req, res) => {
       eventId: event._id,
       freelancerId,
       status: 'assigned',
+      joinedVia: 'direct_admin',
+      eventCode: event.eventCode,
+      eventTitle: event.title,
+      eventDate: event.date,
+      sessionPay: event.sessionPay || 0,
       assignedBy: req.user.id,
       notes: notes || '',
     });
@@ -507,6 +742,11 @@ router.post('/:id/apply', auth, async (req, res) => {
       eventId: event._id,
       freelancerId: req.user.id,
       status: 'applied',
+      joinedVia: 'open_apply',
+      eventCode: event.eventCode,
+      eventTitle: event.title,
+      eventDate: event.date,
+      sessionPay: event.sessionPay || 0,
       appliedAt: new Date(),
     });
 
@@ -572,4 +812,5 @@ router.patch('/:id/applications/:assignmentId/review', adminAuth, async (req, re
   }
 });
 
+router.joinEventByCode = joinEventByCode;
 module.exports = router;

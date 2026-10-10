@@ -189,13 +189,14 @@ app.use('/api/leads', require('./routes/leads'));
 app.use('/api/events', require('./routes/events'));
 app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/payouts', require('./routes/payouts').router);
+app.use('/graphql', require('./graphql'));
 
 // ─── Static Frontend Serving (if built) or Root API Landing Page ──────
 const frontendBuildPath = path.join(__dirname, '../frontend/build');
 if (fs.existsSync(frontendBuildPath)) {
   app.use(express.static(frontendBuildPath));
   app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path === '/health') return next();
+    if (req.path.startsWith('/api') || req.path.startsWith('/graphql') || req.path === '/health') return next();
     res.sendFile(path.join(frontendBuildPath, 'index.html'));
   });
 } else {

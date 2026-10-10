@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import api from '../api';
+import { graphqlQuery, GET_ADMIN_DASHBOARD } from '../graphqlClient';
 import { IconCalendar, IconUsers, IconClock, IconCreditCard } from './icons';
 
 const AdminOverview = ({ onNavigateTab, organization }) => {
@@ -24,11 +25,69 @@ const AdminOverview = ({ onNavigateTab, organization }) => {
 
   useEffect(() => {
     loadDashboardData();
+
+    const handleUpdate = () => loadDashboardData();
+    window.addEventListener('gig:joined', handleUpdate);
+    window.addEventListener('attendance:update', handleUpdate);
+
+    return () => {
+      window.removeEventListener('gig:joined', handleUpdate);
+      window.removeEventListener('attendance:update', handleUpdate);
+    };
   }, []);
 
   const loadDashboardData = async () => {
     try {
       setLoading(true);
+
+      // Single-RTT Unified GraphQL Aggregation
+      try {
+        const data = await graphqlQuery(GET_ADMIN_DASHBOARD);
+        const dash = data?.adminDashboard;
+
+        if (dash) {
+          setStats({
+            activeEvents: dash.kpi?.activeEvents || 0,
+            totalWorkers: dash.kpi?.totalWorkers || 0,
+            pendingOvertimeCount: dash.kpi?.pendingOvertimeCount || 0,
+            pendingPayoutTotal: dash.kpi?.pendingPayoutTotal || 0,
+          });
+
+          setTodayEvents(
+            (dash.upcomingEvents || []).slice(0, 4).map((ev) => ({
+              _id: ev.id,
+              uuid: ev.uuid,
+              title: ev.title,
+              eventCode: ev.eventCode,
+              date: ev.date,
+              startTime: ev.startTime,
+              endTime: ev.endTime,
+              location: { address: ev.address },
+              status: ev.status,
+              sessionPay: ev.sessionPay,
+              requiredWorkers: ev.requiredWorkers,
+              assignedCount: ev.confirmedWorkersCount,
+              waitlistedCount: ev.waitlistedWorkersCount,
+            }))
+          );
+
+          setRecentAttendance(
+            (dash.recentAttendance || []).slice(0, 6).map((att) => ({
+              _id: att.id,
+              eventId: { title: att.eventTitle },
+              freelancerId: { name: att.workerName },
+              checkInAt: att.checkInAt,
+              status: att.status,
+              overtimeStatus: att.overtimeStatus,
+            }))
+          );
+          return;
+        }
+      } catch (gqlErr) {
+        console.warn('GraphQL admin query failed, falling back to REST:', gqlErr);
+      }
+
+      // Seamless REST Fallback
       const [eventsRes, workersRes, attendanceRes, payoutsSummaryRes] = await Promise.all([
         api.get('/events?limit=10'),
         api.get('/auth/workers'),

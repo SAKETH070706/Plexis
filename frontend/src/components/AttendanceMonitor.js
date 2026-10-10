@@ -54,6 +54,15 @@ const AttendanceMonitor = () => {
     }
   };
 
+  const handleAdminCheckout = async (attendanceId) => {
+    try {
+      await api.post('/attendance/admin-checkout', { attendanceId });
+      fetchData();
+    } catch (err) {
+      alert(err.response?.data?.message || 'Check-out failed');
+    }
+  };
+
   const handleOpenOTModal = (record) => {
     setSelectedOTRecord(record);
     setOtMinutesInput(record.overtimeMinutes || 0);
@@ -251,7 +260,28 @@ const AttendanceMonitor = () => {
                         )}
                       </td>
                       <td>
-                        <span className={`badge badge-${rec.status}`}>{rec.status}</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span className={`badge badge-${rec.status}`}>{rec.status}</span>
+                          {rec.status === 'checked_in' && (
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              style={{
+                                background: '#7C3AED',
+                                color: '#fff',
+                                border: 'none',
+                                padding: '3px 8px',
+                                fontSize: '0.74rem',
+                                borderRadius: '4px',
+                                cursor: 'pointer',
+                              }}
+                              onClick={() => handleAdminCheckout(rec._id)}
+                              title="1-Click: Wrap shoot for this worker and queue payout"
+                            >
+                              ⚡ Wrap & Pay
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))

@@ -123,14 +123,14 @@ router.post('/generate/:attendanceId', adminAuth, async (req, res) => {
 // ─── 2. LIST PAYOUTS ─────────────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
   try {
-    const { status, freelancerId, eventId, page = 1, limit = 25 } = req.query;
-    const query = { organizationId: req.user.organizationId };
+    const query = {};
 
-    if (req.user.role !== 'admin') {
-      // Freelancer only sees own payouts
+    if (req.user.role === 'admin') {
+      query.organizationId = req.user.organizationId;
+      if (freelancerId) query.freelancerId = freelancerId;
+    } else {
+      // Freelancer sees all their payouts across any studio
       query.freelancerId = req.user.id;
-    } else if (freelancerId) {
-      query.freelancerId = freelancerId;
     }
 
     if (status) query.status = status;

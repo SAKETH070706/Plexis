@@ -77,10 +77,7 @@ router.post('/check-in', auth, async (req, res) => {
       return res.status(400).json({ message: 'Event ID, latitude, and longitude are required' });
     }
 
-    const event = await Event.findOne({
-      _id: eventId,
-      organizationId: req.user.organizationId,
-    });
+    const event = await Event.findById(eventId);
     if (!event) return res.status(404).json({ message: 'Event not found' });
     if (event.status === 'cancelled') {
       return res.status(400).json({ message: 'Cannot check into a cancelled event' });
@@ -155,12 +152,14 @@ router.post('/check-in', auth, async (req, res) => {
       event.location.radius || 150
     );
 
-    // If worker is outside radius, flag as manual_review
-    const status = geoResult.isWithin ? 'checked_in' : 'manual_review';
-    const method = req.body.checkInMethod === 'auto_gps' ? 'auto_gps' : 'gps';
+    // If attendancePolicy is freelancer_self or attendanceTracking is false, geofencing is bypassed and status is automatically checked_in
+    const bypassGeofence = event.attendancePolicy === 'freelancer_self' || event.attendanceTracking === false;
+    const isTrackingEnabled = !bypassGeofence && event.attendancePolicy !== 'none';
+    const status = (bypassGeofence || geoResult.isWithin) ? 'checked_in' : 'manual_review';
+    const method = bypassGeofence ? 'manual' : (req.body.checkInMethod === 'auto_gps' ? 'auto_gps' : 'gps');
 
     const attendance = new Attendance({
-      organizationId: req.user.organizationId,
+      organizationId: event.organizationId,
       eventId: event._id,
       freelancerId: req.user.id,
       assignmentId: assignment._id,
@@ -172,7 +171,7 @@ router.post('/check-in', auth, async (req, res) => {
         longitude: Number(longitude),
         accuracy: accuracy ? Number(accuracy) : 0,
         distanceFromVenue: geoResult.distanceMeters,
-        isWithinGeofence: geoResult.isWithin,
+        isWithinGeofence: !isTrackingEnabled ? true : geoResult.isWithin,
       },
       checkInMethod: method,
       status,
@@ -184,7 +183,7 @@ router.post('/check-in', auth, async (req, res) => {
     emitSocket(req, 'workerCheckedIn', attendance);
 
     res.status(201).json({
-      message: geoResult.isWithin
+      message: (!isTrackingEnabled || geoResult.isWithin)
         ? 'Check-in verified successfully within geofence'
         : `Check-in recorded outside geofence (${geoResult.distanceMeters}m away) - pending admin review`,
       attendance,
@@ -213,7 +212,6 @@ router.post('/check-out', auth, async (req, res) => {
     const { eventId, attendanceId, latitude, longitude, accuracy, notes } = req.body;
 
     const query = {
-      organizationId: req.user.organizationId,
       freelancerId: req.user.id,
       status: { $in: ['checked_in', 'manual_review'] },
     };
@@ -774,6 +772,310 @@ router.patch('/:id/review-overtime', adminAuth, async (req, res) => {
 
     res.json({ message: `Overtime ${action}d successfully`, attendance });
 
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── 10. ADMIN DIRECT OVERRIDE: CHECK IN WORKER ───────────────────────
+router.post('/admin-checkin', adminAuth, async (req, res) => {
+  try {
+    const { eventId, freelancerId, assignmentId, checkInAt, notes } = req.body;
+
+    if (!eventId || !freelancerId) {
+      return res.status(400).json({ message: 'eventId and freelancerId are required' });
+    }
+
+    const event = await Event.findOne({
+      _id: eventId,
+      organizationId: req.user.organizationId,
+    });
+    if (!event) return res.status(404).json({ message: 'Event not found in your organization' });
+
+    let assignment = null;
+    if (assignmentId) {
+      assignment = await Assignment.findById(assignmentId);
+    }
+    if (!assignment) {
+      assignment = await Assignment.findOne({
+        eventId: event._id,
+        freelancerId,
+        status: { $in: ['assigned', 'accepted'] },
+      });
+    }
+    if (!assignment) {
+      return res.status(400).json({ message: 'Freelancer is not actively assigned to this event' });
+    }
+
+    // Check if attendance already exists
+    let attendance = await Attendance.findOne({
+      eventId: event._id,
+      freelancerId,
+    });
+
+    const checkInTime = checkInAt ? new Date(checkInAt) : new Date();
+
+    if (attendance) {
+      if (attendance.status === 'completed') {
+        return res.status(400).json({ message: 'Shift is already marked completed for this worker', attendance });
+      }
+      attendance.checkInAt = checkInTime;
+      attendance.checkInMethod = 'manual';
+      attendance.status = 'checked_in';
+      attendance.adminReviewedBy = req.user.id;
+      attendance.adminReviewNote = notes || 'Checked in directly by Studio Admin';
+      attendance.updatedAt = Date.now();
+      await attendance.save();
+    } else {
+      const scheduledStart = parseEventDateTime(event.date, event.startTime);
+      const scheduledEnd = parseEventDateTime(event.date, event.endTime);
+
+      attendance = new Attendance({
+        organizationId: req.user.organizationId,
+        eventId: event._id,
+        freelancerId,
+        assignmentId: assignment._id,
+        scheduledStart,
+        scheduledEnd,
+        checkInAt: checkInTime,
+        checkInMethod: 'manual',
+        status: 'checked_in',
+        adminReviewedBy: req.user.id,
+        adminReviewNote: notes || 'Checked in directly by Studio Admin',
+      });
+      await attendance.save();
+    }
+
+    await AuditLog.create({
+      organizationId: req.user.organizationId,
+      actorId: req.user.id,
+      action: 'ADMIN_CHECKIN_OVERRIDE',
+      entityType: 'Attendance',
+      entityId: attendance._id,
+      newValue: { checkInAt: attendance.checkInAt, status: 'checked_in' },
+      reason: notes || 'Studio Admin marked worker present',
+    });
+
+    emitSocket(req, 'workerCheckedIn', attendance, freelancerId.toString());
+    emitSocket(req, 'attendance:update', {
+      eventId: event._id,
+      freelancerId,
+      status: 'checked_in',
+      attendanceId: attendance._id,
+    });
+
+    res.json({ message: 'Worker marked present by Studio Admin', attendance });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── 11. ADMIN DIRECT OVERRIDE: CHECK OUT WORKER ──────────────────────
+router.post('/admin-checkout', adminAuth, async (req, res) => {
+  try {
+    const { attendanceId, eventId, freelancerId, checkOutAt, notes } = req.body;
+
+    let attendance = null;
+    if (attendanceId) {
+      attendance = await Attendance.findOne({
+        _id: attendanceId,
+        organizationId: req.user.organizationId,
+      });
+    } else if (eventId && freelancerId) {
+      attendance = await Attendance.findOne({
+        eventId,
+        freelancerId,
+        organizationId: req.user.organizationId,
+      });
+    }
+
+    if (!attendance) {
+      return res.status(404).json({ message: 'Active attendance record not found for this worker' });
+    }
+
+    const checkOut = checkOutAt ? new Date(checkOutAt) : new Date();
+    const checkIn = attendance.checkInAt || attendance.scheduledStart;
+    const actualMinutes = Math.max(0, Math.round((checkOut - checkIn) / (1000 * 60)));
+    const scheduledMins = Math.max(0, Math.round((attendance.scheduledEnd - attendance.scheduledStart) / (1000 * 60)));
+    const overtimeMins = Math.max(0, actualMinutes - scheduledMins);
+
+    attendance.checkOutAt = checkOut;
+    attendance.checkOutMethod = 'manual';
+    attendance.actualMinutes = actualMinutes;
+    attendance.overtimeMinutes = overtimeMins;
+    attendance.overtimeStatus = overtimeMins > 0 ? 'approved' : 'none';
+    attendance.status = 'completed';
+    attendance.adminReviewedBy = req.user.id;
+    attendance.adminReviewNote = notes || 'Checked out directly by Studio Admin';
+    attendance.updatedAt = Date.now();
+    await attendance.save();
+
+    // Auto-generate payout record so payment is queued immediately
+    try {
+      const { calculateAndSavePayout } = require('./payouts');
+      await calculateAndSavePayout(attendance._id, req.user.organizationId, 'Generated via Admin Check-Out Override');
+    } catch (pErr) {
+      console.warn('[Admin Checkout Payout Notice]:', pErr.message);
+    }
+
+    await AuditLog.create({
+      organizationId: req.user.organizationId,
+      actorId: req.user.id,
+      action: 'ADMIN_CHECKOUT_OVERRIDE',
+      entityType: 'Attendance',
+      entityId: attendance._id,
+      newValue: { checkOutAt: attendance.checkOutAt, actualMinutes, status: 'completed' },
+      reason: notes || 'Studio Admin closed shift for worker',
+    });
+
+    emitSocket(req, 'workerCheckedOut', attendance, attendance.freelancerId.toString());
+    emitSocket(req, 'attendance:update', {
+      eventId: attendance.eventId,
+      freelancerId: attendance.freelancerId,
+      status: 'completed',
+      attendanceId: attendance._id,
+    });
+
+    res.json({ message: 'Worker shift marked completed by Studio Admin', attendance });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── 12. ADMIN DIRECT OVERRIDE: COMPLETE ENTIRE CREW & QUEUE PAYOUTS ──
+router.post('/admin-complete-all', adminAuth, async (req, res) => {
+  try {
+    const { eventId, notes } = req.body;
+
+    if (!eventId) {
+      return res.status(400).json({ message: 'eventId is required' });
+    }
+
+    const event = await Event.findOne({
+      _id: eventId,
+      organizationId: req.user.organizationId,
+    });
+    if (!event) return res.status(404).json({ message: 'Event not found in your organization' });
+
+    const assignments = await Assignment.find({
+      eventId: event._id,
+      status: { $in: ['assigned', 'accepted'] },
+    });
+
+    if (assignments.length === 0) {
+      return res.status(400).json({ message: 'No confirmed crew members found for this event' });
+    }
+
+    const scheduledStart = parseEventDateTime(event.date, event.startTime);
+    const scheduledEnd = parseEventDateTime(event.date, event.endTime);
+    const scheduledMins = Math.max(0, Math.round((scheduledEnd - scheduledStart) / (1000 * 60)));
+
+    const { calculateAndSavePayout } = require('./payouts');
+    const completedList = [];
+
+    for (const as of assignments) {
+      let attendance = await Attendance.findOne({
+        eventId: event._id,
+        freelancerId: as.freelancerId,
+      });
+
+      if (!attendance) {
+        attendance = new Attendance({
+          organizationId: req.user.organizationId,
+          eventId: event._id,
+          freelancerId: as.freelancerId,
+          assignmentId: as._id,
+          scheduledStart,
+          scheduledEnd,
+          checkInAt: scheduledStart,
+          checkInMethod: 'manual',
+          checkOutAt: scheduledEnd,
+          checkOutMethod: 'manual',
+          actualMinutes: scheduledMins,
+          overtimeMinutes: 0,
+          overtimeStatus: 'none',
+          status: 'completed',
+          adminReviewedBy: req.user.id,
+          adminReviewNote: notes || 'Bulk marked present and completed by Studio Admin',
+        });
+      } else {
+        if (!attendance.checkInAt) attendance.checkInAt = scheduledStart;
+        attendance.checkOutAt = attendance.checkOutAt || scheduledEnd;
+        attendance.checkInMethod = 'manual';
+        attendance.checkOutMethod = 'manual';
+        attendance.actualMinutes = attendance.actualMinutes || scheduledMins;
+        attendance.status = 'completed';
+        attendance.adminReviewedBy = req.user.id;
+        attendance.adminReviewNote = notes || 'Bulk marked completed by Studio Admin';
+      }
+
+      await attendance.save();
+      completedList.push(attendance);
+
+      // Auto-generate payout for each worker
+      try {
+        await calculateAndSavePayout(attendance._id, req.user.organizationId, 'Bulk approved via Admin Complete All');
+      } catch (pErr) {
+        console.warn(`[Bulk Complete Payout Notice for ${as.freelancerId}]:`, pErr.message);
+      }
+
+      emitSocket(req, 'workerCheckedOut', attendance, as.freelancerId.toString());
+    }
+
+    emitSocket(req, 'attendance:update', {
+      eventId: event._id,
+      status: 'all_completed',
+      count: completedList.length,
+    });
+
+    res.json({
+      message: `All ${completedList.length} crew members marked completed and queued for payout`,
+      count: completedList.length,
+      attendanceRecords: completedList,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── 13. ADMIN DIRECT OVERRIDE: MARK WORKER ABSENT ────────────────────
+router.post('/admin-mark-absent', adminAuth, async (req, res) => {
+  try {
+    const { eventId, freelancerId, notes } = req.body;
+
+    if (!eventId || !freelancerId) {
+      return res.status(400).json({ message: 'eventId and freelancerId are required' });
+    }
+
+    const assignment = await Assignment.findOne({
+      eventId,
+      freelancerId,
+      organizationId: req.user.organizationId,
+    });
+
+    if (!assignment) {
+      return res.status(404).json({ message: 'Assignment not found for this worker' });
+    }
+
+    assignment.status = 'declined';
+    assignment.notes = notes || 'Marked absent by Studio Admin';
+    assignment.updatedAt = Date.now();
+    await assignment.save();
+
+    // Cancel attendance record if one exists
+    await Attendance.findOneAndUpdate(
+      { eventId, freelancerId },
+      { status: 'rejected', notes: 'Marked absent by Studio Admin', updatedAt: Date.now() }
+    );
+
+    emitSocket(req, 'assignmentCancelled', { eventId, freelancerId }, freelancerId.toString());
+    emitSocket(req, 'attendance:update', {
+      eventId,
+      freelancerId,
+      status: 'absent',
+    });
+
+    res.json({ message: 'Worker marked absent and shift slot released', assignment });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

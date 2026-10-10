@@ -1,6 +1,13 @@
 const mongoose = require('mongoose');
+const { v4: uuidv4 } = require('uuid');
 
 const UserSchema = new mongoose.Schema({
+  uuid: {
+    type: String,
+    unique: true,
+    index: true,
+    default: uuidv4
+  },
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
@@ -11,7 +18,8 @@ const UserSchema = new mongoose.Schema({
   },
   organizationId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Organization'
+    ref: 'Organization',
+    default: null
   },
   phone: { type: String },
   status: {
@@ -26,4 +34,4 @@ const UserSchema = new mongoose.Schema({
 
 UserSchema.index({ organizationId: 1, role: 1, status: 1 });
 
-module.exports = mongoose.model('User', UserSchema);
+module.exports = mongoose.model('User', UserSchema);
